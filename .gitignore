@@ -1,0 +1,8 @@
+# Build output
+build/
+
+# Odin compiler, downloaded locally (see README)
+tools/
+
+# Benchmark results
+bench.txt
