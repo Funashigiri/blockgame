@@ -6,14 +6,20 @@ Tex :: enum u8 {
 	Grass_Top,
 	Grass_Side,
 	Dirt,
+	Stone,
 }
 
 GRASS_COLOR :: [3]f32{112, 178, 72}
 DIRT_COLOR  :: [3]f32{134, 96, 67}
+STONE_COLOR :: [3]f32{128, 128, 128}
 
 // A few discrete brightness steps per pixel read as hand-drawn pixel art rather than smooth noise.
 @(rodata)
 BRIGHTNESS_STEPS := [?]f32{0.78, 0.86, 0.92, 0.97, 1.0, 1.0, 1.05, 1.12}
+
+// Stone is calmer than soil: a narrower spread of greys.
+@(rodata)
+STONE_STEPS := [?]f32{0.88, 0.93, 0.97, 1.0, 1.0, 1.03, 1.06, 1.1}
 
 // Every block texture is drawn here pixel by pixel, so the game ships no borrowed image files.
 // Returns one RGBA 16x16 layer per Tex, back to back.
@@ -48,6 +54,13 @@ texel :: proc(tex: Tex, x, y: i32) -> [3]f32 {
 			return GRASS_COLOR * brightness(x, y, 1)
 		}
 		return DIRT_COLOR * brightness(x, y, 2)
+	case .Stone:
+		color := STONE_COLOR * STONE_STEPS[hash3(x, y, 5) % len(STONE_STEPS)]
+		// Short dark horizontal streaks, like cracks between rock layers.
+		if hash3(x / 3, y, 6) % 7 == 0 {
+			color *= 0.78
+		}
+		return color
 	}
 	return {}
 }

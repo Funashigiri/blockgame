@@ -1,6 +1,7 @@
 package main
 
 import "core:math"
+import "core:math/linalg"
 import gl "vendor:OpenGL"
 
 // Enough for the worst case chunk (a 3D checkerboard) while indices still fit in u16.
@@ -181,22 +182,67 @@ upload_chunk_mesh :: proc(r: ^Renderer, mesh: ^Chunk_Mesh, vertices: []Vertex) {
 	mesh.index_count = i32(len(vertices) / 4 * 6)
 }
 
-// Builds and uploads every chunk; returns the number of block sides drawn.
-mesh_world :: proc(w: ^World, r: ^Renderer) -> int {
+// Builds and uploads every chunk; returns the number of block sides and of chunks that have any.
+mesh_world :: proc(w: ^World, r: ^Renderer) -> (sides, meshed_chunks: int) {
 	vertices := make([dynamic]Vertex, 0, 4096)
 	defer delete(vertices)
-	sides := 0
 	for _, chunk in w.chunks {
 		build_chunk_mesh(w, chunk, &vertices)
 		upload_chunk_mesh(r, &chunk.mesh, vertices[:])
 		sides += len(vertices) / 4
+		if len(vertices) > 0 {
+			meshed_chunks += 1
+		}
 	}
-	return sides
+	return
+}
+
+// Build with -define:NO_CULLING=true to draw everything, e.g. to check culling never hides anything visible.
+NO_CULLING :: #config(NO_CULLING, false)
+
+// The planet is solid at least this far out from its centre, so it hides whatever is behind it.
+OCCLUDER_RADIUS :: PLANET_RADIUS + MIN_HEIGHT
+
+// Planes of the camera's view pyramid, pointing inward (Gribb-Hartmann extraction from the matrix).
+frustum_planes :: proc(m: matrix[4, 4]f32) -> (planes: [6][4]f32) {
+	row :: proc(m: matrix[4, 4]f32, i: int) -> [4]f32 {
+		return {m[i, 0], m[i, 1], m[i, 2], m[i, 3]}
+	}
+	r0, r1, r2, r3 := row(m, 0), row(m, 1), row(m, 2), row(m, 3)
+	planes = {r3 + r0, r3 - r0, r3 + r1, r3 - r1, r3 + r2, r3 - r2}
+	for &p in planes {
+		p /= linalg.length(p.xyz)
+	}
+	return
+}
+
+sphere_in_frustum :: proc(planes: ^[6][4]f32, center: [3]f32, radius: f32) -> bool {
+	for p in planes {
+		if linalg.dot(p.xyz, center) + p.w < -radius {
+			return false
+		}
+	}
+	return true
+}
+
+// Two points can see each other past a ball when the angle between them, seen from the ball's centre,
+// is less than how far each of them sees around it. Errs on the side of drawing.
+beyond_horizon :: proc(camera_pos, center: [3]f64, radius: f64) -> bool {
+	camera_dist := linalg.length(camera_pos)
+	dist := linalg.length(center)
+	top := dist + radius
+	if camera_dist <= OCCLUDER_RADIUS || dist <= radius || top <= OCCLUDER_RADIUS {
+		return false
+	}
+	angle := math.acos(clamp(linalg.dot(camera_pos, center) / (camera_dist * dist), -1, 1))
+	reach := math.acos(OCCLUDER_RADIUS / camera_dist) + math.acos(OCCLUDER_RADIUS / top) + math.asin(radius / dist)
+	return angle > reach
 }
 
 // view_proj must be rotation-only: every chunk is placed relative to the camera, so numbers stay small
 // and precise however far from the planet centre the camera is.
-renderer_draw :: proc(r: ^Renderer, w: ^World, view_proj: matrix[4, 4]f32, camera_pos: [3]f64) {
+// Skips chunks outside the view and chunks hidden behind the planet; returns how many were drawn.
+renderer_draw :: proc(r: ^Renderer, w: ^World, view_proj: matrix[4, 4]f32, camera_pos: [3]f64) -> (drawn: int) {
 	view_proj := view_proj
 
 	// Stars first and without depth, so everything else simply draws over them.
@@ -211,13 +257,24 @@ renderer_draw :: proc(r: ^Renderer, w: ^World, view_proj: matrix[4, 4]f32, camer
 	gl.UniformMatrix4fv(r.u_view_proj, 1, false, &view_proj[0, 0])
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D_ARRAY, r.texture)
+	planes := frustum_planes(view_proj)
 	for _, chunk in w.chunks {
 		if chunk.mesh.index_count == 0 {
 			continue
+		}
+		when !NO_CULLING {
+			if !sphere_in_frustum(&planes, ([3]f32)(chunk.center - camera_pos), f32(chunk.radius)) {
+				continue
+			}
+			if beyond_horizon(camera_pos, chunk.center, chunk.radius) {
+				continue
+			}
 		}
 		offset := ([3]f32)(chunk.anchor - camera_pos)
 		gl.Uniform3f(r.u_chunk_offset, offset.x, offset.y, offset.z)
 		gl.BindVertexArray(chunk.mesh.vao)
 		gl.DrawElements(gl.TRIANGLES, chunk.mesh.index_count, gl.UNSIGNED_SHORT, nil)
+		drawn += 1
 	}
+	return
 }

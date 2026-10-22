@@ -62,6 +62,8 @@ block_texture :: proc(block: Block, side: Side) -> Tex {
 			return .Dirt
 		}
 		return .Grass_Side
+	case .Stone:
+		return .Stone
 	}
 	return .Dirt
 }

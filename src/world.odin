@@ -1,5 +1,7 @@
 package main
 
+import "core:math/linalg"
+
 CHUNK_SIZE   :: 16
 CHUNK_SHIFT  :: 4
 CHUNK_MASK   :: CHUNK_SIZE - 1
@@ -9,7 +11,8 @@ Block :: enum u8 {
 	Air,
 	Grass,
 	Dirt,
-	Core, // solid planet interior, never drawn
+	Stone,
+	Core, // solid planet interior below the generated layers, never drawn
 }
 
 // x and z run across a planet face, y is the layer counted outward from the surface.
@@ -21,12 +24,15 @@ Chunk_Pos :: struct {
 Chunk :: struct {
 	pos:    Chunk_Pos,
 	anchor: [3]f64, // world position of the chunk's (0, 0, 0) corner; mesh vertices are relative to it
+	center: [3]f64, // bounding sphere, for skipping chunks that can't be seen
+	radius: f64,
 	blocks: [CHUNK_VOLUME]Block,
 	mesh:   Chunk_Mesh,
 }
 
 World :: struct {
-	chunks: map[Chunk_Pos]^Chunk,
+	chunks:        map[Chunk_Pos]^Chunk,
+	highest_point: [3]f64, // top of the tallest mountain
 }
 
 block_index :: #force_inline proc "contextless" (x, y, z: i32) -> i32 {
@@ -36,7 +42,15 @@ block_index :: #force_inline proc "contextless" (x, y, z: i32) -> i32 {
 world_new_chunk :: proc(w: ^World, pos: Chunk_Pos) -> ^Chunk {
 	chunk := new(Chunk)
 	chunk.pos = pos
-	chunk.anchor = face_to_world(pos.face, f64(pos.x * CHUNK_SIZE), f64(pos.z * CHUNK_SIZE), f64(pos.y * CHUNK_SIZE))
+	base := [3]f64{f64(pos.x), f64(pos.y), f64(pos.z)} * CHUNK_SIZE
+	chunk.anchor = face_to_world(pos.face, base.x, base.z, base.y)
+	HALF :: CHUNK_SIZE / 2
+	chunk.center = face_to_world(pos.face, base.x + HALF, base.z + HALF, base.y + HALF)
+	// The chunk is bent to follow the ball, so measure to all 8 of its real corners.
+	for i in 0 ..< 8 {
+		corner := base + [3]f64{f64(i & 1), f64(i >> 1 & 1), f64(i >> 2 & 1)} * CHUNK_SIZE
+		chunk.radius = max(chunk.radius, linalg.length(face_to_world(pos.face, corner.x, corner.z, corner.y) - chunk.center))
+	}
 	w.chunks[pos] = chunk
 	return chunk
 }
@@ -50,14 +64,8 @@ world_get_block :: proc(w: ^World, face: Cube_Face, x, y, z: i32) -> Block {
 	}
 	chunk := w.chunks[Chunk_Pos{face, x >> CHUNK_SHIFT, y >> CHUNK_SHIFT, z >> CHUNK_SHIFT}]
 	if chunk == nil {
-		// Nothing generated here: deep down is solid planet, above the terrain is empty space.
+		// Nothing generated here: below the generated floor is solid planet, above the land is empty space.
 		return Block.Core if y < 0 else Block.Air
 	}
 	return chunk.blocks[block_index(x & CHUNK_MASK, y & CHUNK_MASK, z & CHUNK_MASK)]
-}
-
-hash3 :: proc "contextless" (x, y, z: i32) -> u32 {
-	h := u32(x) * 374761393 + u32(y) * 668265263 + u32(z) * 2147483647
-	h = (h ~ (h >> 13)) * 1274126177
-	return h ~ (h >> 16)
 }

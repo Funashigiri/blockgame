@@ -9,7 +9,11 @@ FACE_BLOCKS   :: 240
 FACE_CHUNKS   :: FACE_BLOCKS / CHUNK_SIZE
 PLANET_RADIUS :: f64(FACE_BLOCKS) * 2 / math.PI // about 153 m
 
-SOIL_DEPTH :: 3 // dirt layers under the grass; below them is the solid core
+SOIL_DEPTH :: 3 // dirt layers under the grass; stone below
+
+// Land height in blocks above the base radius stays within these bounds.
+MIN_HEIGHT :: -8
+MAX_HEIGHT :: 48
 
 Cube_Face :: enum i32 {
 	PX,
@@ -73,37 +77,64 @@ cross_face_edge :: proc(face: Cube_Face, x, z: i32) -> (Cube_Face, i32, i32) {
 	return face, x, z
 }
 
+Column :: struct {
+	height: i32,
+	rocky:  bool, // bare stone on top instead of grass and dirt
+}
+
+// Rolling hills everywhere, plus mountain ranges where a slow noise allows them.
+// Sampled at the column's real 3D position, so the land runs on across face edges without a break.
+terrain_column :: proc(face: Cube_Face, x, z: i32) -> Column {
+	p := face_to_world(face, f64(x) + 0.5, f64(z) + 0.5, 0)
+	hills := fbm(p / 45, 4, 1) * 7
+	ranges := math.smoothstep(0.1, 0.4, fbm(p / 90, 2, 2))
+	ridge := 1 - abs(fbm(p / 30, 4, 3)) // sharp crests where the noise crosses zero
+	mountains := ranges * ridge * ridge * 34
+	height := clamp(i32(math.floor(2 + hills + mountains)), MIN_HEIGHT, MAX_HEIGHT)
+	// High peaks are bare rock; a little noise keeps the rock line from being a perfect contour.
+	rock_line := 24 + fbm(p / 12, 2, 4) * 6
+	return {height, f64(height) >= rock_line}
+}
+
+column_block :: proc(c: Column, layer: i32) -> Block {
+	switch {
+	case layer > c.height:
+		return .Air
+	case c.rocky || layer < c.height - SOIL_DEPTH:
+		return .Stone
+	case layer == c.height:
+		return .Grass
+	}
+	return .Dirt
+}
+
 generate_planet :: proc(w: ^World) {
-	heights: [CHUNK_SIZE][CHUNK_SIZE]i32
+	// Every column starts from the same floor, so a cliff above a low valley is never missing its lower part.
+	floor_chunk := i32(MIN_HEIGHT - SOIL_DEPTH - 1) >> CHUNK_SHIFT
+	peak := i32(min(i32))
+	columns: [CHUNK_SIZE][CHUNK_SIZE]Column
 	for face in Cube_Face {
 		for cz in i32(0) ..< FACE_CHUNKS {
 			for cx in i32(0) ..< FACE_CHUNKS {
-				top := min(i32)
+				top := i32(min(i32))
 				for z in i32(0) ..< CHUNK_SIZE {
 					for x in i32(0) ..< CHUNK_SIZE {
-						h := surface_height(face, cx * CHUNK_SIZE + x, cz * CHUNK_SIZE + z)
-						heights[z][x] = h
-						top = max(top, h)
+						gx, gz := cx * CHUNK_SIZE + x, cz * CHUNK_SIZE + z
+						c := terrain_column(face, gx, gz)
+						columns[z][x] = c
+						top = max(top, c.height)
+						if c.height > peak {
+							peak = c.height
+							w.highest_point = face_to_world(face, f64(gx) + 0.5, f64(gz) + 0.5, f64(c.height + 1))
+						}
 					}
 				}
-				// From the chunk holding the deepest dirt up to the one holding the highest grass.
-				for cy := i32(-SOIL_DEPTH - 1) >> CHUNK_SHIFT; cy <= top >> CHUNK_SHIFT; cy += 1 {
+				for cy := floor_chunk; cy <= top >> CHUNK_SHIFT; cy += 1 {
 					chunk := world_new_chunk(w, Chunk_Pos{face, cx, cy, cz})
 					for y in i32(0) ..< CHUNK_SIZE {
-						layer := cy * CHUNK_SIZE + y
 						for z in i32(0) ..< CHUNK_SIZE {
 							for x in i32(0) ..< CHUNK_SIZE {
-								h := heights[z][x]
-								block := Block.Air
-								switch {
-								case layer == h:
-									block = .Grass
-								case layer < h - SOIL_DEPTH:
-									block = .Core
-								case layer < h:
-									block = .Dirt
-								}
-								chunk.blocks[block_index(x, y, z)] = block
+								chunk.blocks[block_index(x, y, z)] = column_block(columns[z][x], cy * CHUNK_SIZE + y)
 							}
 						}
 					}
@@ -111,28 +142,4 @@ generate_planet :: proc(w: ^World) {
 			}
 		}
 	}
-}
-
-// Low mounds a block or two high, so the blocks show on an otherwise smooth ball.
-// The noise is sampled in 3D at the column's real position, so it runs on across face edges without a break.
-surface_height :: proc(face: Cube_Face, x, z: i32) -> i32 {
-	p := face_to_world(face, f64(x) + 0.5, f64(z) + 0.5, 0)
-	n := value_noise_3d(p / 10)
-	return i32(clamp((n - 0.5) * 6, 0, 2))
-}
-
-// Smoothly blended random values on an integer lattice, in 0..1.
-value_noise_3d :: proc(p: [3]f64) -> f64 {
-	cell := [3]f64{math.floor(p.x), math.floor(p.y), math.floor(p.z)}
-	f := p - cell
-	f = f * f * (3 - 2 * f) // smoothstep, so lattice lines don't show as creases
-	ix, iy, iz := i32(cell.x), i32(cell.y), i32(cell.z)
-	corner :: proc(x, y, z: i32) -> f64 {
-		return f64(hash3(x, y, z) & 0xFFFF) / 0xFFFF
-	}
-	x00 := math.lerp(corner(ix, iy, iz), corner(ix + 1, iy, iz), f.x)
-	x10 := math.lerp(corner(ix, iy + 1, iz), corner(ix + 1, iy + 1, iz), f.x)
-	x01 := math.lerp(corner(ix, iy, iz + 1), corner(ix + 1, iy, iz + 1), f.x)
-	x11 := math.lerp(corner(ix, iy + 1, iz + 1), corner(ix + 1, iy + 1, iz + 1), f.x)
-	return math.lerp(math.lerp(x00, x10, f.y), math.lerp(x01, x11, f.y), f.z)
 }

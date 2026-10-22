@@ -11,15 +11,15 @@ import "vendor:glfw"
 import stbi "vendor:stb/image"
 
 GAME_NAME :: "blockgame"
-VERSION   :: "0.0.2"
+VERSION   :: "0.0.3"
 
 WINDOW_WIDTH  :: 1280
 WINDOW_HEIGHT :: 720
 
 SPACE_COLOR :: [3]f32{0.01, 0.01, 0.025}
 
-// Start above the middle of the top face, looking out toward the curved horizon.
-SPAWN_ALTITUDE :: 40.0
+// Start above the middle of the top face, this high above the ground, looking out toward the horizon.
+SPAWN_ALTITUDE :: 30.0
 SPAWN_PITCH    :: -0.45
 
 FOV_DEGREES       :: 70.0
@@ -42,7 +42,8 @@ Frame_Sample :: struct {
 Bench_Info :: struct {
 	vsync:                          bool,
 	refresh_rate, width, height:    int,
-	chunks, sides:                  int,
+	chunks, meshed_chunks, sides:   int,
+	drawn_total:                    int, // chunks drawn, summed over the measured frames
 	generate_seconds, mesh_seconds: f64,
 }
 
@@ -93,7 +94,7 @@ main :: proc() {
 	start := glfw.GetTime()
 	generate_planet(&world)
 	generated := glfw.GetTime()
-	info.sides = mesh_world(&world, &renderer)
+	info.sides, info.meshed_chunks = mesh_world(&world, &renderer)
 	info.generate_seconds = generated - start
 	info.mesh_seconds = glfw.GetTime() - generated
 	info.chunks = len(world.chunks)
@@ -147,10 +148,14 @@ main :: proc() {
 			fps_timer = 0
 		}
 
-		if !draw_frame(window, &renderer, &world, camera) {
+		drawn, ok := draw_frame(window, &renderer, &world, camera)
+		if !ok {
 			// Minimized: sleep until something happens instead of spinning the CPU.
 			glfw.WaitEvents()
 			continue
+		}
+		if bench && bench_time > BENCH_WARMUP_SECONDS {
+			info.drawn_total += drawn
 		}
 		glfw.SwapBuffers(window)
 		free_all(context.temp_allocator)
@@ -166,21 +171,24 @@ main :: proc() {
 }
 
 spawn_camera :: proc() -> Camera {
-	return Camera{pos = {0, PLANET_RADIUS + SPAWN_ALTITUDE, 0}, heading = {0, 0, -1}, pitch = SPAWN_PITCH}
+	MIDDLE :: FACE_BLOCKS / 2
+	ground := terrain_column(.PY, MIDDLE, MIDDLE).height
+	pos := face_to_world(.PY, MIDDLE, MIDDLE, f64(ground) + SPAWN_ALTITUDE)
+	return Camera{pos = pos, heading = {0, 0, -1}, pitch = SPAWN_PITCH}
 }
 
-draw_frame :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World, cam: Camera) -> bool {
+// Returns how many chunks were drawn; ok is false when the window is minimized and nothing was drawn.
+draw_frame :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World, cam: Camera) -> (drawn: int, ok: bool) {
 	width, height := glfw.GetFramebufferSize(window)
 	if width == 0 || height == 0 {
-		return false
+		return 0, false
 	}
 	gl.Viewport(0, 0, width, height)
 	gl.ClearColor(SPACE_COLOR.r, SPACE_COLOR.g, SPACE_COLOR.b, 1)
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 	aspect := f32(width) / f32(height)
 	projection := linalg.matrix4_perspective_f32(math.to_radians(f32(FOV_DEGREES)), aspect, NEAR_PLANE, FAR_PLANE)
-	renderer_draw(r, w, projection * camera_view(cam), cam.pos)
-	return true
+	return renderer_draw(r, w, projection * camera_view(cam), cam.pos), true
 }
 
 key_down :: proc(window: glfw.WindowHandle, key: i32) -> bool {
@@ -213,12 +221,12 @@ fly_controls :: proc(window: glfw.WindowHandle, cam: ^Camera, dt: f32) {
 	camera_align(cam)
 }
 
-// One full lap at 40 blocks up along a tilted circle, so the flight crosses several faces and seams.
+// One full lap along a tilted circle above the highest peaks, so the flight crosses several faces and seams.
 bench_fly :: proc(cam: ^Camera, t: f64) {
 	angle := t / (BENCH_WARMUP_SECONDS + BENCH_SECONDS) * 2 * math.PI
 	a := [3]f64{1, 0, 0}
 	b := linalg.normalize([3]f64{0, 0.6, 0.8})
-	cam.pos = (a * math.cos(angle) + b * math.sin(angle)) * (PLANET_RADIUS + 40)
+	cam.pos = (a * math.cos(angle) + b * math.sin(angle)) * (PLANET_RADIUS + MAX_HEIGHT + 8)
 	cam.heading = ([3]f32)(b * math.cos(angle) - a * math.sin(angle))
 	cam.pitch = -0.35
 	camera_align(cam)
@@ -263,6 +271,7 @@ write_bench_report :: proc(frames: []Frame_Sample, info: Bench_Info) {
 		"gpu: %s\n" +
 		"resolution: %dx%d, vsync %s, screen %d Hz\n" +
 		"world: %d chunks, %d block sides, built in %.2f s (generate %.2f + mesh %.2f)\n" +
+		"drawn per frame: %d of %d chunks that have blocks to show\n" +
 		"frames: %d in %.1f s\n" +
 		"average FPS: %.0f\n" +
 		"1%% low FPS: %.0f\n" +
@@ -273,6 +282,7 @@ write_bench_report :: proc(frames: []Frame_Sample, info: Bench_Info) {
 		gl.GetString(gl.RENDERER),
 		info.width, info.height, "on" if info.vsync else "off", info.refresh_rate,
 		info.chunks, info.sides, info.generate_seconds + info.mesh_seconds, info.generate_seconds, info.mesh_seconds,
+		info.drawn_total / len(frames), info.meshed_chunks,
 		len(frames), total,
 		f64(len(frames)) / total,
 		f64(slow_count) / slow_total,
@@ -295,14 +305,17 @@ save_bench_screenshots :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^Worl
 	}
 	// A cube corner, where three faces and three seams meet.
 	corner := linalg.normalize([3]f64{1, 1, 1})
-	beside := linalg.normalize(linalg.cross(corner, [3]f64{0, 1, 0}))
+	peak := w.highest_point
+	up := linalg.normalize(peak)
+	beside := linalg.normalize(linalg.cross(up, [3]f64{0, 0, 1} if abs(up.z) < 0.9 else [3]f64{1, 0, 0}))
 	shots := [?]Camera {
-		spawn_camera(),                                                       // what the player sees on start
-		look_from(corner * (PLANET_RADIUS + 350), {0, 0, 0}),                 // the whole planet from far away
-		look_from(corner * (PLANET_RADIUS + 14) + beside * 22, corner * PLANET_RADIUS), // close-up of a corner
+		spawn_camera(),                                               // what the player sees on start
+		look_from(corner * (PLANET_RADIUS + 350), {0, 0, 0}),         // the whole planet from far away
+		look_from(peak + up * 6 + beside * 45, peak - up * 12),       // the tallest mountain up close
+		look_from(peak + up * 60 + beside * 110, peak - up * 10),     // its mountain range from above
 	}
 	for shot, i in shots {
-		if !draw_frame(window, r, w, shot) {
+		if _, ok := draw_frame(window, r, w, shot); !ok {
 			return
 		}
 		save_screenshot(window, fmt.ctprintf("bench_%d.png", i + 1))
