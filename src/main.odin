@@ -11,23 +11,28 @@ import "vendor:glfw"
 import stbi "vendor:stb/image"
 
 GAME_NAME :: "blockgame"
-VERSION   :: "0.0.3"
+VERSION   :: "0.0.4"
 
 WINDOW_WIDTH  :: 1280
 WINDOW_HEIGHT :: 720
 
 SPACE_COLOR :: [3]f32{0.01, 0.01, 0.025}
 
-// Start above the middle of the top face, this high above the ground, looking out toward the horizon.
-SPAWN_ALTITUDE :: 30.0
-SPAWN_PITCH    :: -0.45
+// Start standing in the middle of the top face, looking out a little below the horizon.
+SPAWN_PITCH :: -0.1
 
-FOV_DEGREES       :: 70.0
-NEAR_PLANE        :: 0.05
-FAR_PLANE         :: 2000.0
-FLY_SPEED         :: 11.0 // blocks per second
-SPRINT_MULTIPLIER :: 2.5
-MOUSE_SENSITIVITY :: 0.0022 // radians per pixel
+FOV_DEGREES        :: 70.0
+NEAR_PLANE         :: 0.05
+FAR_PLANE          :: 2000.0
+FLY_SPEED          :: 11.0 // blocks per second
+SPRINT_MULTIPLIER  :: 2.5  // Ctrl while flying
+MOUSE_SENSITIVITY  :: 0.0022 // radians per pixel
+DOUBLE_TAP_SECONDS :: 0.3  // two jump presses this close together switch flying on or off
+
+Key_State :: struct {
+	jump_was_down:   bool,
+	last_jump_press: f64,
+}
 
 // --bench flies a fixed circle around the planet and writes bench.txt.
 // Without a frame cap it shows the headroom; --bench-vsync runs locked to the screen like real play
@@ -50,6 +55,7 @@ Bench_Info :: struct {
 main :: proc() {
 	bench_vsync := slice.contains(os.args, "--bench-vsync")
 	bench := bench_vsync || slice.contains(os.args, "--bench")
+	self_test := slice.contains(os.args, "--test")
 
 	if !glfw.Init() {
 		fmt.eprintln("Could not start GLFW")
@@ -71,7 +77,7 @@ main :: proc() {
 	glfw.MakeContextCurrent(window)
 	gl.load_up_to(3, 3, glfw.gl_set_proc_address)
 
-	if bench {
+	if bench || self_test {
 		// Measure at nearly full screen, the worst case for the graphics chip.
 		glfw.MaximizeWindow(window)
 		glfw.SwapInterval(1 if bench_vsync else 0)
@@ -99,7 +105,13 @@ main :: proc() {
 	info.mesh_seconds = glfw.GetTime() - generated
 	info.chunks = len(world.chunks)
 
+	if self_test {
+		os.exit(0 if run_self_test(window, &renderer, &world) else 1)
+	}
+
+	player := spawn_player()
 	camera := spawn_camera()
+	keys := Key_State{last_jump_press = -1}
 
 	last_mouse_x, last_mouse_y := glfw.GetCursorPos(window)
 	last_time := glfw.GetTime()
@@ -136,14 +148,17 @@ main :: proc() {
 			camera.pitch = clamp(camera.pitch, -PITCH_LIMIT, PITCH_LIMIT)
 			last_mouse_x, last_mouse_y = mouse_x, mouse_y
 			// A long hitch (dragging the window) must not throw the player across the map.
-			fly_controls(window, &camera, f32(min(dt, 0.1)))
+			player_update(&world, &player, camera.heading, read_input(window, &keys), min(dt, 0.1))
+			camera.pos = player_eye(player)
+			camera_align(&camera)
 		}
 
 		fps_frames += 1
 		fps_timer += dt
 		if fps_timer >= 1 {
 			fps := int(f64(fps_frames) / fps_timer + 0.5)
-			glfw.SetWindowTitle(window, fmt.ctprintf("%s %s | %d FPS", GAME_NAME, VERSION, fps))
+			mode := "полёт" if player.flying else "ходьба"
+			glfw.SetWindowTitle(window, fmt.ctprintf("%s %s | %d FPS | %s", GAME_NAME, VERSION, fps, mode))
 			fps_frames = 0
 			fps_timer = 0
 		}
@@ -170,11 +185,15 @@ main :: proc() {
 	}
 }
 
-spawn_camera :: proc() -> Camera {
+// Standing on top of the column in the middle of the top face.
+spawn_player :: proc() -> Player {
 	MIDDLE :: FACE_BLOCKS / 2
 	ground := terrain_column(.PY, MIDDLE, MIDDLE).height
-	pos := face_to_world(.PY, MIDDLE, MIDDLE, f64(ground) + SPAWN_ALTITUDE)
-	return Camera{pos = pos, heading = {0, 0, -1}, pitch = SPAWN_PITCH}
+	return Player{pos = face_to_world(.PY, MIDDLE + 0.5, MIDDLE + 0.5, f64(ground + 1))}
+}
+
+spawn_camera :: proc() -> Camera {
+	return Camera{pos = player_eye(spawn_player()), heading = {0, 0, -1}, pitch = SPAWN_PITCH}
 }
 
 // Returns how many chunks were drawn; ok is false when the window is minimized and nothing was drawn.
@@ -195,30 +214,33 @@ key_down :: proc(window: glfw.WindowHandle, key: i32) -> bool {
 	return glfw.GetKey(window, key) == glfw.PRESS
 }
 
-// Creative-style flight around the planet: W/S/A/D move along the ground relative to where you look,
-// Space/Shift go straight up/down. Moving along the ground keeps your height, so W alone circles the planet.
-fly_controls :: proc(window: glfw.WindowHandle, cam: ^Camera, dt: f32) {
-	along: [3]f32
-	vertical: f32
-	if key_down(window, glfw.KEY_W) {along += cam.heading}
-	if key_down(window, glfw.KEY_S) {along -= cam.heading}
-	if key_down(window, glfw.KEY_D) {along += camera_right(cam^)}
-	if key_down(window, glfw.KEY_A) {along -= camera_right(cam^)}
-	if key_down(window, glfw.KEY_SPACE) {vertical += 1}
-	if key_down(window, glfw.KEY_LEFT_SHIFT) {vertical -= 1}
-	if along == 0 && vertical == 0 {
-		return
+// W/S/A/D walk (or fly) relative to where you look, Space jumps (rises when flying), Shift sinks when flying,
+// Ctrl runs, and a quick double tap of Space switches flying on or off.
+read_input :: proc(window: glfw.WindowHandle, keys: ^Key_State) -> (input: Input) {
+	if key_down(window, glfw.KEY_W) {input.move.y += 1}
+	if key_down(window, glfw.KEY_S) {input.move.y -= 1}
+	if key_down(window, glfw.KEY_D) {input.move.x += 1}
+	if key_down(window, glfw.KEY_A) {input.move.x -= 1}
+	input.jump = key_down(window, glfw.KEY_SPACE)
+	input.descend = key_down(window, glfw.KEY_LEFT_SHIFT)
+	input.sprint = key_down(window, glfw.KEY_LEFT_CONTROL)
+	input.toggle_fly = jump_double_tap(keys, input.jump, glfw.GetTime())
+	return
+}
+
+// True on the press that comes within DOUBLE_TAP_SECONDS of the previous one.
+// A third quick press starts a new pair instead of switching back straight away.
+jump_double_tap :: proc(keys: ^Key_State, down: bool, now: f64) -> (toggle: bool) {
+	if down && !keys.jump_was_down {
+		if keys.last_jump_press >= 0 && now - keys.last_jump_press < DOUBLE_TAP_SECONDS {
+			toggle = true
+			keys.last_jump_press = -1
+		} else {
+			keys.last_jump_press = now
+		}
 	}
-	speed: f32 = FLY_SPEED
-	if key_down(window, glfw.KEY_LEFT_CONTROL) {
-		speed *= SPRINT_MULTIPLIER
-	}
-	// Divide by the length of the whole move, so diagonal flight isn't faster.
-	step := speed * dt / math.sqrt(linalg.dot(along, along) + vertical * vertical)
-	radius := linalg.length(cam.pos)
-	cam.pos += ([3]f64)(along * step)
-	cam.pos = linalg.normalize(cam.pos) * max(radius + f64(vertical * step), 1)
-	camera_align(cam)
+	keys.jump_was_down = down
+	return
 }
 
 // One full lap along a tilted circle above the highest peaks, so the flight crosses several faces and seams.

@@ -51,10 +51,35 @@ face_to_world :: proc(face: Cube_Face, u, v, layer: f64) -> [3]f64 {
 	return linalg.normalize(dir) * (PLANET_RADIUS + layer)
 }
 
-// Moves a column that sits one block past a face edge onto the neighbouring face.
+// Which face a world position is over, and where in that face's block grid it is: x and z across the face
+// (0..FACE_BLOCKS), y the layer above the base radius. The inverse of face_to_world.
+world_to_face :: proc(p: [3]f64) -> (Cube_Face, [3]f64) {
+	axis := 0
+	for i in 1 ..< 3 {
+		if abs(p[i]) > abs(p[axis]) {
+			axis = i
+		}
+	}
+	face := Cube_Face(axis * 2 + (0 if p[axis] > 0 else 1))
+	return face, world_to_face_on(face, p)
+}
+
+// Like world_to_face, but in the grid of the given face even a little past its edge,
+// so a move that crosses an edge can still be measured in one grid.
+world_to_face_on :: proc(face: Cube_Face, p: [3]f64) -> [3]f64 {
+	axes := FACE_AXES[face]
+	n := linalg.dot(p, ([3]f64)(axes.normal))
+	s := linalg.dot(p, ([3]f64)(axes.u)) / n
+	t := linalg.dot(p, ([3]f64)(axes.v)) / n
+	u := (math.atan(s) * 4 / math.PI + 1) * FACE_BLOCKS / 2
+	v := (math.atan(t) * 4 / math.PI + 1) * FACE_BLOCKS / 2
+	return {u, linalg.length(p) - PLANET_RADIUS, v}
+}
+
+// Moves a column that sits past a face edge onto the neighbouring face.
 // Works on column centres in a doubled integer grid where the cube spans -N..N, so the fold is exact:
 // the axis that overshot is pulled back onto the cube and becomes the new face's normal, and the old
-// normal axis becomes an in-face axis, one block in from the edge.
+// normal axis becomes an in-face axis, as many blocks in from the edge as the column was past it.
 cross_face_edge :: proc(face: Cube_Face, x, z: i32) -> (Cube_Face, i32, i32) {
 	N :: FACE_BLOCKS
 	axes := FACE_AXES[face]
@@ -63,11 +88,12 @@ cross_face_edge :: proc(face: Cube_Face, x, z: i32) -> (Cube_Face, i32, i32) {
 		if abs(p[i]) <= N {
 			continue
 		}
+		overshoot := abs(p[i]) - N
 		sign: i32 = 1 if p[i] > 0 else -1
 		p[i] = sign * N
 		for j in 0 ..< 3 {
 			if axes.normal[j] != 0 {
-				p[j] = axes.normal[j] * (N - 1)
+				p[j] = axes.normal[j] * (N - overshoot)
 			}
 		}
 		new_face := Cube_Face(i * 2 + (0 if sign > 0 else 1))

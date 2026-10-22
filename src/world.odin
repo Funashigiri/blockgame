@@ -55,11 +55,15 @@ world_new_chunk :: proc(w: ^World, pos: Chunk_Pos) -> ^Chunk {
 	return chunk
 }
 
-// x and z may be one block past the face edge; the lookup then continues on the neighbouring face.
-// Arithmetic shift and mask act as floor division and modulo, so negative layers land in the right chunk.
+// x and z may be a few blocks past the face edge; the lookup then continues on the neighbouring face,
+// or near a cube corner on the third face. Arithmetic shift and mask act as floor division and modulo,
+// so negative layers land in the right chunk.
 world_get_block :: proc(w: ^World, face: Cube_Face, x, y, z: i32) -> Block {
 	face, x, z := face, x, z
-	if x < 0 || x >= FACE_BLOCKS || z < 0 || z >= FACE_BLOCKS {
+	for _ in 0 ..< 2 {
+		if x >= 0 && x < FACE_BLOCKS && z >= 0 && z < FACE_BLOCKS {
+			break
+		}
 		face, x, z = cross_face_edge(face, x, z)
 	}
 	chunk := w.chunks[Chunk_Pos{face, x >> CHUNK_SHIFT, y >> CHUNK_SHIFT, z >> CHUNK_SHIFT}]

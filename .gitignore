@@ -4,5 +4,6 @@ build/
 # Odin compiler, downloaded locally (see README)
 tools/
 
-# Benchmark results
+# Benchmark and self-test results
 bench.txt
+test.txt
