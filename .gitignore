@@ -7,3 +7,4 @@ tools/
 # Benchmark and self-test results
 bench.txt
 test.txt
+test_settings.txt

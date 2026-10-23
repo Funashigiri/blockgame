@@ -11,7 +11,7 @@ import "vendor:glfw"
 import stbi "vendor:stb/image"
 
 GAME_NAME :: "blockgame"
-VERSION   :: "0.0.5"
+VERSION   :: "0.0.6"
 
 WINDOW_WIDTH  :: 1280
 WINDOW_HEIGHT :: 720
@@ -56,6 +56,10 @@ main :: proc() {
 	bench_vsync := slice.contains(os.args, "--bench-vsync")
 	bench := bench_vsync || slice.contains(os.args, "--bench")
 	self_test := slice.contains(os.args, "--test")
+	// Benchmarks and the self-test always start the same way, so they neither read nor change the settings.
+	playing := !bench && !self_test
+	path := settings_path()
+	settings := settings_load(path) if playing else DEFAULT_SETTINGS
 
 	if !glfw.Init() {
 		fmt.eprintln("Could not start GLFW")
@@ -68,7 +72,7 @@ main :: proc() {
 	glfw.WindowHint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 	glfw.WindowHint(glfw.OPENGL_FORWARD_COMPAT, true)
 
-	window := glfw.CreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, GAME_NAME + " " + VERSION, nil, nil)
+	window := glfw.CreateWindow(settings.window_size.x, settings.window_size.y, GAME_NAME + " " + VERSION, nil, nil)
 	if window == nil {
 		fmt.eprintln("Could not open a window with OpenGL 3.3")
 		return
@@ -77,20 +81,25 @@ main :: proc() {
 	glfw.MakeContextCurrent(window)
 	gl.load_up_to(3, 3, glfw.gl_set_proc_address)
 
-	if bench || self_test {
-		// Measure at nearly full screen, the worst case for the graphics chip.
-		glfw.MaximizeWindow(window)
-		glfw.SwapInterval(1 if bench_vsync else 0)
-	} else {
+	if playing {
 		glfw.SwapInterval(1)
-		glfw.SetInputMode(window, glfw.CURSOR, glfw.CURSOR_DISABLED)
+		// Start as the remembered window, then switch to the remembered mode.
+		glfw.SetWindowPos(window, settings.window_pos.x, settings.window_pos.y)
+		start_mode := settings.display
+		settings.display = .Windowed
+		apply_display_mode(window, &settings, start_mode)
 		if glfw.RawMouseMotionSupported() {
 			glfw.SetInputMode(window, glfw.RAW_MOUSE_MOTION, 1)
 		}
+	} else {
+		// Measure at nearly full screen, the worst case for the graphics chip.
+		glfw.MaximizeWindow(window)
+		glfw.SwapInterval(1 if bench_vsync else 0)
 	}
 
 	renderer: Renderer
-	if !renderer_init(&renderer) {
+	ui: UI
+	if !renderer_init(&renderer) || !ui_init(&ui) {
 		fmt.eprintln("Could not compile shaders")
 		return
 	}
@@ -106,7 +115,7 @@ main :: proc() {
 	info.chunks = len(world.chunks)
 
 	if self_test {
-		os.exit(0 if run_self_test(window, &renderer, &world) else 1)
+		os.exit(0 if run_self_test(window, &renderer, &ui, &world) else 1)
 	}
 
 	player := spawn_player()
@@ -116,10 +125,25 @@ main :: proc() {
 	looked_at: Ray_Hit
 	break_down, place_down: bool
 	break_timer, place_timer: f64
+	paused := false
+	escape_was_down, f11_was_down, click_was_down: bool
 
 	last_mouse_x, last_mouse_y := glfw.GetCursorPos(window)
+	// While playing the mouse turns the view and its pointer is hidden; on pause the pointer comes back.
+	// Coming back from pause, mouse buttons already held don't count as a click in the world.
+	set_paused :: proc(window: glfw.WindowHandle, paused: bool, last_mouse_x, last_mouse_y: ^f64, break_down, place_down: ^bool) {
+		glfw.SetInputMode(window, glfw.CURSOR, glfw.CURSOR_NORMAL if paused else glfw.CURSOR_DISABLED)
+		if !paused {
+			last_mouse_x^, last_mouse_y^ = glfw.GetCursorPos(window)
+			break_down^, place_down^ = true, true
+		}
+	}
+	if playing {
+		set_paused(window, false, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
+	}
+
 	last_time := glfw.GetTime()
-	fps_frames := 0
+	fps, fps_frames := 0, 0
 	fps_timer := 0.0
 
 	bench_time := 0.0
@@ -132,11 +156,10 @@ main :: proc() {
 		last_time = now
 
 		glfw.PollEvents()
-		if key_down(window, glfw.KEY_ESCAPE) {
-			glfw.SetWindowShouldClose(window, true)
-		}
-
 		if bench {
+			if key_down(window, glfw.KEY_ESCAPE) {
+				break
+			}
 			bench_time += dt
 			if bench_time > BENCH_WARMUP_SECONDS {
 				append(&bench_frames, Frame_Sample{at = bench_time, dt = dt})
@@ -146,6 +169,23 @@ main :: proc() {
 			}
 			bench_fly(&camera, bench_time)
 		} else {
+			escape, f11 := key_down(window, glfw.KEY_ESCAPE), key_down(window, glfw.KEY_F11)
+			if escape && !escape_was_down {
+				paused = !paused
+				set_paused(window, paused, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
+			}
+			if f11 && !f11_was_down {
+				toggle_full_screen(window, &settings)
+			}
+			escape_was_down, f11_was_down = escape, f11
+			// Like Minecraft: switching to another program pauses the game.
+			if !paused && glfw.GetWindowAttrib(window, glfw.FOCUSED) == 0 {
+				paused = true
+				set_paused(window, paused, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
+			}
+		}
+
+		if !bench && !paused {
 			mouse_x, mouse_y := glfw.GetCursorPos(window)
 			camera_turn(&camera, f32(mouse_x - last_mouse_x) * MOUSE_SENSITIVITY)
 			camera.pitch -= f32(mouse_y - last_mouse_y) * MOUSE_SENSITIVITY
@@ -177,16 +217,16 @@ main :: proc() {
 		fps_frames += 1
 		fps_timer += dt
 		if fps_timer >= 1 {
-			fps := int(f64(fps_frames) / fps_timer + 0.5)
-			mode := "полёт" if player.flying else "ходьба"
+			fps = int(f64(fps_frames) / fps_timer + 0.5)
+			mode := "пауза" if paused else "полёт" if player.flying else "ходьба"
 			title := fmt.ctprintf("%s %s | %d FPS | %s | блок: %s", GAME_NAME, VERSION, fps, mode, BLOCK_NAMES[PLACEABLE[selected]])
 			glfw.SetWindowTitle(window, title)
 			fps_frames = 0
 			fps_timer = 0
 		}
 
-		target: Maybe(Block_Pos) = looked_at.block if looked_at.hit else nil
-		drawn, ok := draw_frame(window, &renderer, &world, camera, target, !bench)
+		target: Maybe(Block_Pos) = looked_at.block if looked_at.hit && !paused else nil
+		drawn, ok := draw_frame(window, &renderer, &world, camera, target, playing && !paused)
 		if !ok {
 			// Minimized: sleep until something happens instead of spinning the CPU.
 			glfw.WaitEvents()
@@ -195,10 +235,33 @@ main :: proc() {
 		if bench && bench_time > BENCH_WARMUP_SECONDS {
 			info.drawn_total += drawn
 		}
+
+		click := glfw.GetMouseButton(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+		if paused {
+			width, height := glfw.GetFramebufferSize(window)
+			ui_begin(&ui, width, height, mouse_in_pixels(window), click && !click_was_down)
+			switch pause_menu(&ui, settings.display, fps) {
+			case .Resume:
+				paused = false
+				set_paused(window, paused, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
+			case .Next_Display_Mode:
+				apply_display_mode(window, &settings, next_display_mode(settings.display))
+			case .Quit:
+				glfw.SetWindowShouldClose(window, true)
+			case .None:
+			}
+			ui_end(&ui)
+		}
+		click_was_down = click
+
 		glfw.SwapBuffers(window)
 		free_all(context.temp_allocator)
 	}
 
+	if playing {
+		remember_window(window, &settings)
+		settings_save(path, settings)
+	}
 	if bench {
 		width, height := glfw.GetFramebufferSize(window)
 		info.width, info.height = int(width), int(height)
@@ -206,6 +269,17 @@ main :: proc() {
 		write_bench_report(bench_frames[:], info)
 		save_bench_screenshots(window, &renderer, &world)
 	}
+}
+
+// The mouse pointer in framebuffer pixels, from the top-left corner.
+mouse_in_pixels :: proc(window: glfw.WindowHandle) -> [2]f32 {
+	x, y := glfw.GetCursorPos(window)
+	window_w, window_h := glfw.GetWindowSize(window)
+	pixels_w, pixels_h := glfw.GetFramebufferSize(window)
+	if window_w == 0 || window_h == 0 {
+		return {}
+	}
+	return {f32(x) * f32(pixels_w) / f32(window_w), f32(y) * f32(pixels_h) / f32(window_h)}
 }
 
 // Standing on top of the column in the middle of the top face.

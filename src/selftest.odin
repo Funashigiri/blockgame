@@ -50,7 +50,7 @@ feet_layer :: proc(p: Player) -> f64 {
 	return grid.y
 }
 
-run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World) -> bool {
+run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, ui: ^UI, w: ^World) -> bool {
 	log: Test_Log
 	log.text = strings.builder_make()
 	p := spawn_player()
@@ -214,6 +214,8 @@ run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World) -> boo
 	test_screenshot(window, r, w, cam, 6)
 	test_check(&log, slowest_edit < 0.004, "edits are quick", fmt.tprintf("slowest break or place took %.2f ms", slowest_edit * 1000))
 
+	test_interface(&log, window, r, ui, w)
+
 	fmt.sbprintf(&log.text, "\n%s\n", "ALL PASSED" if log.failed == 0 else fmt.tprintf("%d FAILED", log.failed))
 	report := strings.to_string(log.text)
 	if err := os.write_entire_file("test.txt", report); err != nil {
@@ -221,4 +223,129 @@ run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World) -> boo
 	}
 	fmt.print(report)
 	return log.failed == 0
+}
+
+// Every letter the menus might ever need, and everything the pause menu actually says.
+ALPHABETS :: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя0123456789"
+
+font_missing :: proc(f: ^Font, text: string) -> string {
+	missing := strings.builder_make(context.temp_allocator)
+	for r in text {
+		if _, ok := font_glyph(f, r); !ok && r != ' ' {
+			strings.write_rune(&missing, r)
+		}
+	}
+	return strings.to_string(missing)
+}
+
+test_interface :: proc(log: ^Test_Log, window: glfw.WindowHandle, r: ^Renderer, ui: ^UI, w: ^World) {
+	missing := font_missing(&ui.font, ALPHABETS)
+	test_check(log, missing == "", "font has every letter", fmt.tprintf("%d glyphs, missing: \"%s\"", len(ui.font.glyphs), missing))
+
+	// Render the pause menu once off-screen to collect its text, and check every character is drawable.
+	width, height := glfw.GetFramebufferSize(window)
+	menu_text := strings.builder_make(context.temp_allocator)
+	for mode in Display_Mode {
+		fmt.sbprintf(&menu_text, "Пауза Продолжить Экран: %s Выйти из игры Esc — вернуться в игру F11 — полный экран 60 FPS ", DISPLAY_MODE_NAMES[mode])
+	}
+	missing = font_missing(&ui.font, strings.to_string(menu_text))
+	test_check(log, missing == "", "font covers the menu text", fmt.tprintf("missing: \"%s\"", missing))
+
+	// The whole font on a dark background, for a look.
+	cam := spawn_camera()
+	draw_frame(window, r, w, cam)
+	ui_begin(ui, width, height, {-1, -1}, false)
+	ui_rect(ui, 0, 0, ui.size.x, ui.size.y, {20, 20, 30, 255})
+	lines := [?]string {
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+		"abcdefghijklmnopqrstuvwxyz",
+		"АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ",
+		"абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+		"0123456789 .,:;!?-—+=_()/%|'\"<>",
+		"Съешь же ещё этих мягких французских булок, да выпей чаю.",
+		"The quick brown fox jumps over the lazy dog.",
+	}
+	for line, i in lines {
+		ui_text(ui, line, 8, 8 + f32(i) * 14, WHITE)
+	}
+	ui_end(ui)
+	save_screenshot(window, "test_7.png")
+	glfw.SwapBuffers(window)
+
+	// Where the pause menu puts its buttons, in screen pixels (same layout as pause_menu).
+	ui.scale = gui_scale(width, height)
+	gui := [2]f32{f32(width), f32(height)} / ui.scale
+	center := math.floor(gui.x / 2)
+	first_button_y := math.floor(gui.y / 4) + 20
+	button_center :: proc(center, first_y: f32, index: int, scale: f32) -> [2]f32 {
+		return [2]f32{center, first_y + f32(index) * BUTTON_STEP + BUTTON_H / 2} * scale
+	}
+
+	// The pause menu over the world, with the mouse resting on the second button.
+	draw_frame(window, r, w, cam)
+	ui_begin(ui, width, height, button_center(center, first_button_y, 1, ui.scale), false)
+	pause_menu(ui, .Windowed, 60)
+	ui_end(ui)
+	save_screenshot(window, "test_8.png")
+	glfw.SwapBuffers(window)
+
+	// Clicks land on the right buttons, and a click on empty space does nothing.
+	clicks := [?]struct {
+		mouse: [2]f32,
+		want:  Menu_Action,
+	} {
+		{button_center(center, first_button_y, 0, ui.scale), .Resume},
+		{button_center(center, first_button_y, 1, ui.scale), .Next_Display_Mode},
+		{button_center(center, first_button_y, 2, ui.scale), .Quit},
+		{{2, 2}, .None},
+	}
+	all_right := true
+	got: [dynamic]Menu_Action
+	got.allocator = context.temp_allocator
+	for c in clicks {
+		ui_begin(ui, width, height, c.mouse, true)
+		action := pause_menu(ui, .Windowed, 60)
+		append(&got, action)
+		all_right &= action == c.want
+	}
+	clear(&ui.vertices)
+	test_check(log, all_right, "menu buttons", fmt.tprintf("clicks gave %v", got[:]))
+
+	// Each display mode: borderless and full screen cover the whole monitor, windowed comes back to its size.
+	settings := DEFAULT_SETTINGS
+	remember_window(window, &settings)
+	window_size := settings.window_size
+	video := glfw.GetVideoMode(glfw.GetPrimaryMonitor())
+	settle :: proc() {
+		for _ in 0 ..< 10 {
+			glfw.WaitEventsTimeout(0.05)
+		}
+	}
+	sizes: [Display_Mode][2]i32
+	for mode in ([3]Display_Mode{.Borderless, .Fullscreen, .Windowed}) {
+		apply_display_mode(window, &settings, mode)
+		settle()
+		fw, fh := glfw.GetFramebufferSize(window)
+		sizes[mode] = {fw, fh}
+	}
+	screen := [2]i32{video.width, video.height}
+	test_check(log, sizes[.Borderless] == screen && sizes[.Fullscreen] == screen && sizes[.Windowed] == window_size, "display modes",
+		fmt.tprintf("borderless %v, full screen %v (screen %v), windowed %v (was %v)",
+			sizes[.Borderless], sizes[.Fullscreen], screen, sizes[.Windowed], window_size))
+	toggle_full_screen(window, &settings)
+	settle()
+	fw, fh := glfw.GetFramebufferSize(window)
+	went_full := settings.display == .Fullscreen && [2]i32{fw, fh} == screen
+	toggle_full_screen(window, &settings)
+	settle()
+	fw, fh = glfw.GetFramebufferSize(window)
+	test_check(log, went_full && settings.display == .Windowed && [2]i32{fw, fh} == window_size, "F11",
+		fmt.tprintf("full screen %v, back in a window %v", went_full, [2]i32{fw, fh}))
+
+	// Settings survive a save and a load.
+	saved := Settings{.Borderless, .Borderless, {12, 34}, {800, 600}}
+	settings_save("test_settings.txt", saved)
+	loaded := settings_load("test_settings.txt")
+	_ = os.remove("test_settings.txt")
+	test_check(log, loaded == saved, "settings are remembered", fmt.tprintf("saved %v, loaded %v", saved, loaded))
 }
