@@ -7,19 +7,16 @@ REACH               :: 5.0  // blocks; a touch more than Minecraft's 4.5
 RAY_STEP            :: 0.01 // the look ray is walked in steps this short, so it can't skip past a corner
 EDIT_REPEAT_SECONDS :: 0.25 // holding a mouse button keeps breaking or placing at this pace
 
-// Blocks the number keys 1-5 pick for placing, and their names for the window title.
-@(rodata)
-PLACEABLE := [5]Block{.Grass, .Dirt, .Stone, .Sand, .Planks}
-
+// As shown over the hotbar and on the F3 screen.
 @(rodata)
 BLOCK_NAMES := [Block]string {
-	.Air    = "воздух",
-	.Grass  = "трава",
-	.Dirt   = "земля",
-	.Stone  = "камень",
-	.Sand   = "песок",
-	.Planks = "доски",
-	.Core   = "ядро",
+	.Air    = "Воздух",
+	.Grass  = "Трава",
+	.Dirt   = "Земля",
+	.Stone  = "Камень",
+	.Sand   = "Песок",
+	.Planks = "Доски",
+	.Core   = "Ядро",
 }
 
 Ray_Hit :: struct {

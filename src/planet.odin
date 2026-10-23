@@ -106,6 +106,38 @@ cross_face_edge :: proc(face: Cube_Face, x, z: i32) -> (Cube_Face, i32, i32) {
 	return face, x, z
 }
 
+// The planet turns about an axis through the middle of the -Z face (the north pole) and of the +Z face
+// (the south pole), so the game starts on the equator at 0°, 0°, facing north.
+NORTH_POLE     :: [3]f64{0, 0, -1}
+PRIME_MERIDIAN :: [3]f64{0, 1, 0} // 0° on the equator: the middle of the top face, where the game starts
+EAST_90        :: [3]f64{1, 0, 0} // 90° east on the equator
+
+// Latitude (positive north) and longitude (positive east), in degrees.
+latitude_longitude :: proc(p: [3]f64) -> (latitude, longitude: f64) {
+	d := linalg.normalize(p)
+	latitude = math.to_degrees(math.asin(clamp(linalg.dot(d, NORTH_POLE), -1, 1)))
+	longitude = math.to_degrees(math.atan2(linalg.dot(d, EAST_90), linalg.dot(d, PRIME_MERIDIAN)))
+	return
+}
+
+// Which way a heading along the ground points: degrees clockwise from north, so 90 is east.
+// Right on a pole there is no such thing, and at_pole is true.
+compass_bearing :: proc(p: [3]f64, heading: [3]f32) -> (degrees: f64, at_pole: bool) {
+	up := linalg.normalize(p)
+	north := NORTH_POLE - up * linalg.dot(NORTH_POLE, up)
+	if linalg.length(north) < 1e-9 {
+		return 0, true
+	}
+	north = linalg.normalize(north)
+	east := linalg.cross(north, up)
+	h := ([3]f64)(heading)
+	degrees = math.to_degrees(math.atan2(linalg.dot(h, east), linalg.dot(h, north)))
+	if degrees < 0 {
+		degrees += 360
+	}
+	return
+}
+
 Column :: struct {
 	height: i32,
 	rocky:  bool, // bare stone on top instead of grass and dirt

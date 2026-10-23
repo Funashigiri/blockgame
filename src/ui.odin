@@ -10,7 +10,10 @@ UI_Vertex :: struct {
 	pos:   [2]f32, // screen pixels, from the top-left corner
 	uv:    [2]f32,
 	color: [4]u8,
+	layer: f32, // block texture layer for block pictures, FONT_LAYER for text and plain rectangles
 }
+
+FONT_LAYER :: -1
 
 Color :: [4]u8
 
@@ -25,29 +28,41 @@ UI_VERTEX_SHADER :: `#version 330 core
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
 layout(location = 2) in vec4 a_color;
+layout(location = 3) in float a_layer;
 uniform vec2 u_screen;
 out vec2 v_uv;
 out vec4 v_color;
+flat out float v_layer;
 void main() {
 	vec2 ndc = a_pos / u_screen * 2.0 - 1.0;
 	gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
 	v_uv = a_uv;
 	v_color = a_color;
+	v_layer = a_layer;
 }
 `
 
+// Text and rectangles take their shape from the font texture; block pictures use the world's block textures,
+// so the whole interface is still one draw.
 UI_FRAGMENT_SHADER :: `#version 330 core
 in vec2 v_uv;
 in vec4 v_color;
+flat in float v_layer;
 uniform sampler2D u_font;
+uniform sampler2DArray u_blocks;
 out vec4 frag_color;
 void main() {
-	frag_color = vec4(v_color.rgb, v_color.a * texture(u_font, v_uv).r);
+	if (v_layer < 0.0) {
+		frag_color = vec4(v_color.rgb, v_color.a * texture(u_font, v_uv).r);
+	} else {
+		frag_color = vec4(texture(u_blocks, vec3(v_uv, v_layer)).rgb * v_color.rgb, v_color.a);
+	}
 }
 `
 
 UI :: struct {
 	program, texture, vao, vbo: u32,
+	blocks_texture:             u32, // the renderer's block texture array
 	u_screen:                   i32,
 	vertices:                   [dynamic]UI_Vertex,
 	font:                       Font,
@@ -58,13 +73,17 @@ UI :: struct {
 	clicked:                    bool,   // the left button went down this frame
 }
 
-ui_init :: proc(ui: ^UI) -> bool {
+ui_init :: proc(ui: ^UI, blocks_texture: u32) -> bool {
 	program, ok := gl.load_shaders_source(UI_VERTEX_SHADER, UI_FRAGMENT_SHADER)
 	if !ok {
 		return false
 	}
 	ui.program = program
 	ui.u_screen = gl.GetUniformLocation(program, "u_screen")
+	ui.blocks_texture = blocks_texture
+	gl.UseProgram(program)
+	gl.Uniform1i(gl.GetUniformLocation(program, "u_font"), 0)
+	gl.Uniform1i(gl.GetUniformLocation(program, "u_blocks"), 1)
 
 	font_build(&ui.font)
 	gl.GenTextures(1, &ui.texture)
@@ -87,6 +106,8 @@ ui_init :: proc(ui: ^UI) -> bool {
 	gl.VertexAttribPointer(1, 2, gl.FLOAT, false, stride, offset_of(UI_Vertex, uv))
 	gl.EnableVertexAttribArray(2)
 	gl.VertexAttribPointer(2, 4, gl.UNSIGNED_BYTE, true, stride, offset_of(UI_Vertex, color))
+	gl.EnableVertexAttribArray(3)
+	gl.VertexAttribPointer(3, 1, gl.FLOAT, false, stride, offset_of(UI_Vertex, layer))
 	gl.BindVertexArray(0)
 	return true
 }
@@ -110,14 +131,50 @@ ui_quad :: proc(ui: ^UI, x, y, w, h: f32, uv0, uv1: [2]f32, color: Color) {
 	s := ui.scale
 	x0, y0, x1, y1 := x * s, y * s, (x + w) * s, (y + h) * s
 	append(&ui.vertices,
-		UI_Vertex{{x0, y0}, {uv0.x, uv0.y}, color}, UI_Vertex{{x1, y0}, {uv1.x, uv0.y}, color}, UI_Vertex{{x1, y1}, {uv1.x, uv1.y}, color},
-		UI_Vertex{{x0, y0}, {uv0.x, uv0.y}, color}, UI_Vertex{{x1, y1}, {uv1.x, uv1.y}, color}, UI_Vertex{{x0, y1}, {uv0.x, uv1.y}, color})
+		UI_Vertex{{x0, y0}, {uv0.x, uv0.y}, color, FONT_LAYER}, UI_Vertex{{x1, y0}, {uv1.x, uv0.y}, color, FONT_LAYER},
+		UI_Vertex{{x1, y1}, {uv1.x, uv1.y}, color, FONT_LAYER}, UI_Vertex{{x0, y0}, {uv0.x, uv0.y}, color, FONT_LAYER},
+		UI_Vertex{{x1, y1}, {uv1.x, uv1.y}, color, FONT_LAYER}, UI_Vertex{{x0, y1}, {uv0.x, uv1.y}, color, FONT_LAYER})
 }
 
 // A plain rectangle: samples the solid cell of the font texture.
 ui_rect :: proc(ui: ^UI, x, y, w, h: f32, color: Color) {
 	solid := [2]f32{f32(FONT_CELL_W / 2) / FONT_ATLAS_W, f32(FONT_CELL_H / 2) / FONT_ATLAS_H}
 	ui_quad(ui, x, y, w, h, solid, solid, color)
+}
+
+// A hollow rectangle: lines `thickness` pixels wide just inside x, y, w, h.
+ui_frame :: proc(ui: ^UI, x, y, w, h, thickness: f32, color: Color) {
+	t := thickness
+	ui_rect(ui, x, y, w, t, color)
+	ui_rect(ui, x, y + h - t, w, t, color)
+	ui_rect(ui, x, y + t, t, h - 2 * t, color)
+	ui_rect(ui, x + w - t, y + t, t, h - 2 * t, color)
+}
+
+// One side of a block picture: a block texture stretched over any four corners, given clockwise
+// from the texture's top-left. color darkens it, for sides in shade.
+ui_block_side :: proc(ui: ^UI, corners: [4][2]f32, tex: Tex, color: Color) {
+	uvs := [4][2]f32{{0, 0}, {1, 0}, {1, 1}, {0, 1}}
+	v: [4]UI_Vertex
+	for corner, i in corners {
+		v[i] = {corner * ui.scale, uvs[i], color, f32(tex)}
+	}
+	append(&ui.vertices, v[0], v[1], v[2], v[0], v[2], v[3])
+}
+
+// A block as Minecraft pictures it in the hotbar: a 10-pixel cube turned 45° and tipped 30° towards
+// the viewer, lit from above, its two visible sides in shade. Fits a 16 x 16 square around center.
+ui_block_icon :: proc(ui: ^UI, block: Block, center: [2]f32) {
+	HALF_WIDTH :: 7.07       // 10 * sqrt(2) / 2
+	TOP_HALF_HEIGHT :: 3.54  // HALF_WIDTH * sin 30°
+	EDGE :: 8.66             // 10 * cos 30°, the upright edges
+	top := center - {0, TOP_HALF_HEIGHT + EDGE / 2}
+	left, right := top + {-HALF_WIDTH, TOP_HALF_HEIGHT}, top + {HALF_WIDTH, TOP_HALF_HEIGHT}
+	front := top + {0, 2 * TOP_HALF_HEIGHT}
+	down := [2]f32{0, EDGE}
+	ui_block_side(ui, {top, right, front, left}, block_texture(block, .Up), WHITE)
+	ui_block_side(ui, {left, front, front + down, left + down}, block_texture(block, .South), {204, 204, 204, 255})
+	ui_block_side(ui, {front, right, right + down, front + down}, block_texture(block, .East), {153, 153, 153, 255})
 }
 
 // x, y is the top-left corner of the capitals. A dark copy one pixel down-right gives the Minecraft shadow.
@@ -171,6 +228,8 @@ ui_end :: proc(ui: ^UI) {
 	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 	gl.UseProgram(ui.program)
 	gl.Uniform2f(ui.u_screen, ui.screen.x, ui.screen.y)
+	gl.ActiveTexture(gl.TEXTURE1)
+	gl.BindTexture(gl.TEXTURE_2D_ARRAY, ui.blocks_texture)
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D, ui.texture)
 	gl.BindVertexArray(ui.vao)
@@ -189,8 +248,9 @@ Menu_Action :: enum {
 	Quit,
 }
 
-// The Esc menu: the world stays visible, dimmed, behind it.
-pause_menu :: proc(ui: ^UI, display: Display_Mode, fps: int) -> (action: Menu_Action) {
+// The Esc menu: the world stays visible, dimmed, behind it. The FPS corner is left out when the F3 screen
+// already shows it.
+pause_menu :: proc(ui: ^UI, display: Display_Mode, fps: int, show_fps := true) -> (action: Menu_Action) {
 	ui_rect(ui, 0, 0, ui.size.x, ui.size.y, {0, 0, 0, 140})
 	center := math.floor(ui.size.x / 2)
 	y := math.floor(ui.size.y / 4)
@@ -208,7 +268,10 @@ pause_menu :: proc(ui: ^UI, display: Display_Mode, fps: int) -> (action: Menu_Ac
 	if ui_button(ui, "Выйти из игры", x, y, BUTTON_W, BUTTON_H) {
 		action = .Quit
 	}
-	ui_text_centered(ui, "Esc — вернуться в игру     F11 — полный экран", center, ui.size.y - 16, HINT_TEXT)
-	ui_text(ui, fmt.tprintf("%d FPS", fps), 4, 4, WHITE)
+	// Under the buttons, clear of the hotbar at the bottom of the screen.
+	ui_text_centered(ui, "Esc — вернуться в игру     F11 — полный экран", center, y + BUTTON_H + 16, HINT_TEXT)
+	if show_fps {
+		ui_text(ui, fmt.tprintf("%d FPS", fps), 4, 4, WHITE)
+	}
 	return
 }

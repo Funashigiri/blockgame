@@ -5,6 +5,7 @@ import "core:math"
 import "core:math/linalg"
 import "core:os"
 import "core:strings"
+import gl "vendor:OpenGL"
 import "vendor:glfw"
 
 // --test plays the game by itself with simulated keys and checks that standing, jumping, walking and
@@ -159,8 +160,10 @@ run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, ui: ^UI, w: ^Worl
 	}
 	cam.pitch = -0.6
 	hit := raycast(w, cam.pos, look_direction(cam))
+	hotbar := new_hotbar()
+	hotbar_pick(&hotbar, 4, 0) // planks
 	start_time := glfw.GetTime()
-	placed := hit.hit && try_place(w, r, p, hit.before, .Planks)
+	placed := hit.hit && place_selected(w, r, p, hit.before, hotbar)
 	timed(&slowest_edit, start_time)
 	there := world_get_block(w, hit.before.face, hit.before.x, hit.before.y, hit.before.z)
 	test_check(&log, placed && there == .Planks, "place a block",
@@ -168,11 +171,20 @@ run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, ui: ^UI, w: ^Worl
 	up := linalg.normalize(p.pos)
 	own := block_at_world(p.pos + up * 0.5)
 	test_check(&log, !try_place(w, r, p, own, .Stone), "can't place a block inside yourself", fmt.tprintf("cell %v", own))
+	hotbar_pick(&hotbar, 5, 0) // the first empty slot
+	hit = raycast(w, cam.pos, look_direction(cam))
+	placed = place_selected(w, r, p, hit.before, hotbar)
+	there = world_get_block(w, hit.before.face, hit.before.x, hit.before.y, hit.before.z)
+	test_check(&log, hit.hit && !placed && there == .Air, "an empty slot places nothing",
+		fmt.tprintf("placed %v, block there now: %v", placed, there))
 
-	// A row of two-high pillars of every placeable block, for a look at the textures.
+	// A row of two-high pillars of every block in the hotbar, for a look at the textures.
 	forward := linalg.normalize(([3]f64)(cam.heading))
 	right := linalg.cross(forward, up)
-	for block, i in PLACEABLE {
+	for block, i in HOTBAR {
+		if block == .Air {
+			continue
+		}
 		base := block_at_world(p.pos + forward * 4 + right * f64(i - 2) * 1.5 + up * 0.5)
 		for level in i32(0) ..< 2 {
 			start_time = glfw.GetTime()
@@ -215,6 +227,7 @@ run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, ui: ^UI, w: ^Worl
 	test_check(&log, slowest_edit < 0.004, "edits are quick", fmt.tprintf("slowest break or place took %.2f ms", slowest_edit * 1000))
 
 	test_interface(&log, window, r, ui, w)
+	test_hud(&log, window, r, ui, w)
 
 	fmt.sbprintf(&log.text, "\n%s\n", "ALL PASSED" if log.failed == 0 else fmt.tprintf("%d FAILED", log.failed))
 	report := strings.to_string(log.text)
@@ -281,9 +294,10 @@ test_interface :: proc(log: ^Test_Log, window: glfw.WindowHandle, r: ^Renderer, 
 		return [2]f32{center, first_y + f32(index) * BUTTON_STEP + BUTTON_H / 2} * scale
 	}
 
-	// The pause menu over the world, with the mouse resting on the second button.
+	// The pause menu over the world and the hotbar, with the mouse resting on the second button.
 	draw_frame(window, r, w, cam)
 	ui_begin(ui, width, height, button_center(center, first_button_y, 1, ui.scale), false)
+	hud_hotbar(ui, new_hotbar(), 0)
 	pause_menu(ui, .Windowed, 60)
 	ui_end(ui)
 	save_screenshot(window, "test_8.png")
@@ -348,4 +362,111 @@ test_interface :: proc(log: ^Test_Log, window: glfw.WindowHandle, r: ^Renderer, 
 	loaded := settings_load("test_settings.txt")
 	_ = os.remove("test_settings.txt")
 	test_check(log, loaded == saved, "settings are remembered", fmt.tprintf("saved %v, loaded %v", saved, loaded))
+}
+
+// The hotbar and the F3 screen: picking blocks with keys and the wheel, the name that fades,
+// the compass, and that the font can write everything the F3 screen says.
+test_hud :: proc(log: ^Test_Log, window: glfw.WindowHandle, r: ^Renderer, ui: ^UI, w: ^World) {
+	// Wheel down steps right, wheel up steps left, round past either end; touchpad fractions add up.
+	h := new_hotbar()
+	moves := [?]f64{-1, 2, 1, 1, -1, -0.4, -0.4, -0.4}
+	trail: [dynamic]int
+	trail.allocator = context.temp_allocator
+	for wheel, i in moves {
+		hotbar_scroll(&h, wheel, f64(i))
+		append(&trail, h.selected)
+	}
+	hotbar_pick(&h, 6, 10) // key 7
+	append(&trail, h.selected)
+	want := []int{3, 1, 0, 8, 0, 0, 0, 1, 6}
+	same := len(trail) == len(want)
+	for slot, i in trail {
+		same &= i < len(want) && slot == want[i]
+	}
+	test_check(log, same, "hotbar wheel and keys", fmt.tprintf("slots %v (want %v)", trail[:], want))
+
+	// The name of a picked block shows for a while, then fades; nothing shows at the start or for an empty slot.
+	h = new_hotbar()
+	at_start := hotbar_name_alpha(h, 0.5)
+	hotbar_pick(&h, 3, 10) // sand
+	shown := [3]f64{hotbar_name_alpha(h, 10.1), hotbar_name_alpha(h, 11.75), hotbar_name_alpha(h, 12.1)}
+	hotbar_pick(&h, 7, 13)
+	empty := hotbar_name_alpha(h, 13.1)
+	test_check(log, at_start == 0 && shown == [3]f64{1, 0.5, 0} && empty == 0, "block name over the hotbar",
+		fmt.tprintf("at start %.2f; after picking %.2f, %.2f, %.2f; empty slot %.2f", at_start, shown[0], shown[1], shown[2], empty))
+
+	// The game starts next to 0°, 0° facing north; a right turn faces east; the +X face is at 90° east;
+	// the north pole is the middle of the -Z face.
+	cam := spawn_camera()
+	latitude, longitude := latitude_longitude(cam.pos)
+	bearing, _ := compass_bearing(cam.pos, cam.heading)
+	turned := cam
+	camera_turn(&turned, math.PI / 2)
+	east, _ := compass_bearing(turned.pos, turned.heading)
+	_, east_longitude := latitude_longitude({PLANET_RADIUS, 0, 0})
+	pole_latitude, _ := latitude_longitude(NORTH_POLE * PLANET_RADIUS)
+	_, at_pole := compass_bearing(NORTH_POLE * PLANET_RADIUS, {1, 0, 0})
+	test_check(log,
+		abs(latitude) < 0.5 && abs(longitude) < 0.5 && compass_point(bearing) == "север" && compass_point(east) == "восток" &&
+		abs(east_longitude - 90) < 0.01 && abs(pole_latitude - 90) < 0.01 && at_pole, "compass",
+		fmt.tprintf("start at %.2f, %.2f facing %.0f° (%s); turned right %.0f° (%s); +X face at %.1f° east; pole at %.1f°, at pole %v",
+			latitude, longitude, bearing, compass_point(bearing), east, compass_point(east), east_longitude, pole_latitude, at_pole))
+
+	// Every line the F3 screen can show: both hemispheres, both poles, every compass point, every block.
+	gpu := string(gl.GetString(gl.RENDERER))
+	text := strings.builder_make(context.temp_allocator)
+	places := [?][3]f64{{0, 1, 0}, {-1, -1, 1}, NORTH_POLE, -NORTH_POLE}
+	for place, i in places {
+		info := Debug_Info{fps = 60, feet = place * PLANET_RADIUS, heading = {1, 0, 0}, flying = i % 2 == 0, gpu = gpu}
+		info.looking_at = .Stone if i % 2 == 0 else .Air
+		left, right := debug_lines(info)
+		for line in left {
+			fmt.sbprintf(&text, "%s ", line)
+		}
+		for line in right {
+			fmt.sbprintf(&text, "%s ", line)
+		}
+	}
+	for point in COMPASS_POINTS {
+		fmt.sbprintf(&text, "%s ", point)
+	}
+	for name in BLOCK_NAMES {
+		fmt.sbprintf(&text, "%s ", name)
+	}
+	missing := font_missing(&ui.font, strings.to_string(text))
+	test_check(log, missing == "", "font covers the hotbar and F3 text", fmt.tprintf("missing: \"%s\"", missing))
+
+	// The view on starting, with a block just picked and the F3 screen on.
+	width, height := glfw.GetFramebufferSize(window)
+	hit := raycast(w, cam.pos, look_direction(cam))
+	target: Maybe(Block_Pos) = hit.block if hit.hit else nil
+	drawn, _ := draw_frame(window, r, w, cam, target, true)
+	h = new_hotbar()
+	hotbar_pick(&h, 4, 0) // planks, picked just now
+	looking: Block = .Air
+	if hit.hit {
+		looking = world_get_block(w, hit.block.face, hit.block.x, hit.block.y, hit.block.z)
+	}
+	start_time := glfw.GetTime()
+	ui_begin(ui, width, height, {-1, -1}, false)
+	hud_hotbar(ui, h, 0.1)
+	debug_screen(ui, Debug_Info {
+		fps = 60,
+		worst_frame = TEST_FRAME,
+		feet = spawn_player().pos,
+		heading = cam.heading,
+		looking_at = looking,
+		chunks_drawn = drawn,
+		chunks_with_blocks = count_chunks_with_blocks(w),
+		screen = {width, height},
+		refresh_rate = int(glfw.GetVideoMode(glfw.GetPrimaryMonitor()).refresh_rate),
+		gpu = gpu,
+	})
+	build_seconds := glfw.GetTime() - start_time
+	quads := len(ui.vertices) / 6
+	ui_end(ui)
+	save_screenshot(window, "test_9.png")
+	glfw.SwapBuffers(window)
+	test_check(log, build_seconds < 0.001, "hotbar and F3 are quick",
+		fmt.tprintf("%d pieces, laid out in %.3f ms (F3 included)", quads, build_seconds * 1000))
 }

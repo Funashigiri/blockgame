@@ -11,7 +11,7 @@ import "vendor:glfw"
 import stbi "vendor:stb/image"
 
 GAME_NAME :: "blockgame"
-VERSION   :: "0.0.6"
+VERSION   :: "0.0.7"
 
 WINDOW_WIDTH  :: 1280
 WINDOW_HEIGHT :: 720
@@ -32,6 +32,13 @@ DOUBLE_TAP_SECONDS :: 0.3  // two jump presses this close together switch flying
 Key_State :: struct {
 	jump_was_down:   bool,
 	last_jump_press: f64,
+}
+
+// Mouse wheel movement since it was last read; GLFW reports it through a callback.
+wheel_moved: f64
+
+wheel_callback :: proc "c" (window: glfw.WindowHandle, x, y: f64) {
+	wheel_moved += y
 }
 
 // --bench flies a fixed circle around the planet and writes bench.txt.
@@ -91,6 +98,10 @@ main :: proc() {
 		if glfw.RawMouseMotionSupported() {
 			glfw.SetInputMode(window, glfw.RAW_MOUSE_MOTION, 1)
 		}
+		glfw.SetScrollCallback(window, wheel_callback)
+		// A key pressed and let go between two frames still counts once, so a quick tap of F3 or Esc
+		// isn't lost, even during a slow frame.
+		glfw.SetInputMode(window, glfw.STICKY_KEYS, 1)
 	} else {
 		// Measure at nearly full screen, the worst case for the graphics chip.
 		glfw.MaximizeWindow(window)
@@ -99,10 +110,13 @@ main :: proc() {
 
 	renderer: Renderer
 	ui: UI
-	if !renderer_init(&renderer) || !ui_init(&ui) {
+	if !renderer_init(&renderer) || !ui_init(&ui, renderer.texture) {
 		fmt.eprintln("Could not compile shaders")
 		return
 	}
+	gpu := string(gl.GetString(gl.RENDERER))
+	// Asking the system for the screen mode is slow, so it is asked once, not on every frame.
+	refresh_rate := int(glfw.GetVideoMode(glfw.GetPrimaryMonitor()).refresh_rate)
 
 	world: World
 	info := Bench_Info{vsync = bench_vsync}
@@ -121,12 +135,14 @@ main :: proc() {
 	player := spawn_player()
 	camera := spawn_camera()
 	keys := Key_State{last_jump_press = -1}
-	selected := 2 // index into PLACEABLE: stone
+	hotbar := new_hotbar()
 	looked_at: Ray_Hit
 	break_down, place_down: bool
 	break_timer, place_timer: f64
 	paused := false
-	escape_was_down, f11_was_down, click_was_down: bool
+	// The benchmark keeps the F3 screen on, so its cost is part of the measurement.
+	show_debug := bench
+	escape_was_down, f11_was_down, f3_was_down, click_was_down: bool
 
 	last_mouse_x, last_mouse_y := glfw.GetCursorPos(window)
 	// While playing the mouse turns the view and its pointer is hidden; on pause the pointer comes back.
@@ -145,6 +161,7 @@ main :: proc() {
 	last_time := glfw.GetTime()
 	fps, fps_frames := 0, 0
 	fps_timer := 0.0
+	slowest_frame, worst_frame := 0.0, 0.0 // in this second so far, and in the last whole second
 
 	bench_time := 0.0
 	bench_frames: [dynamic]Frame_Sample
@@ -169,7 +186,7 @@ main :: proc() {
 			}
 			bench_fly(&camera, bench_time)
 		} else {
-			escape, f11 := key_down(window, glfw.KEY_ESCAPE), key_down(window, glfw.KEY_F11)
+			escape, f11, f3 := key_down(window, glfw.KEY_ESCAPE), key_down(window, glfw.KEY_F11), key_down(window, glfw.KEY_F3)
 			if escape && !escape_was_down {
 				paused = !paused
 				set_paused(window, paused, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
@@ -177,13 +194,20 @@ main :: proc() {
 			if f11 && !f11_was_down {
 				toggle_full_screen(window, &settings)
 			}
-			escape_was_down, f11_was_down = escape, f11
+			if f3 && !f3_was_down {
+				show_debug = !show_debug
+			}
+			escape_was_down, f11_was_down, f3_was_down = escape, f11, f3
 			// Like Minecraft: switching to another program pauses the game.
 			if !paused && glfw.GetWindowAttrib(window, glfw.FOCUSED) == 0 {
 				paused = true
 				set_paused(window, paused, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
 			}
 		}
+
+		// Wheel turns made in the pause menu don't count once the game goes on.
+		wheel := wheel_moved
+		wheel_moved = 0
 
 		if !bench && !paused {
 			mouse_x, mouse_y := glfw.GetCursorPos(window)
@@ -196,11 +220,12 @@ main :: proc() {
 			camera.pos = player_eye(player)
 			camera_align(&camera)
 
-			for i in 0 ..< len(PLACEABLE) {
-				if key_down(window, glfw.KEY_1 + i32(i)) {
-					selected = i
+			for slot in 0 ..< HOTBAR_SLOTS {
+				if key_down(window, glfw.KEY_1 + i32(slot)) {
+					hotbar_pick(&hotbar, slot, now)
 				}
 			}
+			hotbar_scroll(&hotbar, wheel, now)
 			looked_at = raycast(&world, camera.pos, look_direction(camera))
 			breaking := glfw.GetMouseButton(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
 			placing := glfw.GetMouseButton(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
@@ -208,7 +233,7 @@ main :: proc() {
 				try_break(&world, &renderer, looked_at.block)
 			}
 			if button_fires(placing, &place_down, &place_timer, dt) && looked_at.hit {
-				try_place(&world, &renderer, player, looked_at.before, PLACEABLE[selected])
+				place_selected(&world, &renderer, player, looked_at.before, hotbar)
 			}
 			// Look again, so the outline already sits on what the edit left behind.
 			looked_at = raycast(&world, camera.pos, look_direction(camera))
@@ -216,13 +241,11 @@ main :: proc() {
 
 		fps_frames += 1
 		fps_timer += dt
+		slowest_frame = max(slowest_frame, dt)
 		if fps_timer >= 1 {
 			fps = int(f64(fps_frames) / fps_timer + 0.5)
-			mode := "пауза" if paused else "полёт" if player.flying else "ходьба"
-			title := fmt.ctprintf("%s %s | %d FPS | %s | блок: %s", GAME_NAME, VERSION, fps, mode, BLOCK_NAMES[PLACEABLE[selected]])
-			glfw.SetWindowTitle(window, title)
-			fps_frames = 0
-			fps_timer = 0
+			worst_frame = slowest_frame
+			fps_frames, fps_timer, slowest_frame = 0, 0, 0
 		}
 
 		target: Maybe(Block_Pos) = looked_at.block if looked_at.hit && !paused else nil
@@ -237,10 +260,31 @@ main :: proc() {
 		}
 
 		click := glfw.GetMouseButton(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+		width, height := glfw.GetFramebufferSize(window)
+		ui_begin(&ui, width, height, mouse_in_pixels(window), click && !click_was_down)
+		hud_hotbar(&ui, hotbar, now)
+		if show_debug {
+			looking: Block = .Air
+			if looked_at.hit {
+				looking = world_get_block(&world, looked_at.block.face, looked_at.block.x, looked_at.block.y, looked_at.block.z)
+			}
+			debug_screen(&ui, Debug_Info {
+				fps = fps,
+				worst_frame = worst_frame,
+				feet = camera.pos if bench else player.pos,
+				heading = camera.heading,
+				looking_at = looking,
+				flying = player.flying,
+				chunks_drawn = drawn,
+				chunks_with_blocks = count_chunks_with_blocks(&world),
+				screen = {width, height},
+				refresh_rate = refresh_rate,
+				gpu = gpu,
+			})
+		}
+		// Over the hotbar and the F3 screen, which stay visible, dimmed, behind the menu.
 		if paused {
-			width, height := glfw.GetFramebufferSize(window)
-			ui_begin(&ui, width, height, mouse_in_pixels(window), click && !click_was_down)
-			switch pause_menu(&ui, settings.display, fps) {
+			switch pause_menu(&ui, settings.display, fps, show_fps = !show_debug) {
 			case .Resume:
 				paused = false
 				set_paused(window, paused, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
@@ -250,8 +294,8 @@ main :: proc() {
 				glfw.SetWindowShouldClose(window, true)
 			case .None:
 			}
-			ui_end(&ui)
 		}
+		ui_end(&ui)
 		click_was_down = click
 
 		glfw.SwapBuffers(window)
