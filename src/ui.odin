@@ -1,7 +1,7 @@
 package main
 
-import "core:fmt"
 import "core:math"
+import "core:slice"
 import gl "vendor:OpenGL"
 
 // Menus are laid out in "GUI pixels" and blown up by a whole number, like Minecraft,
@@ -71,6 +71,16 @@ UI :: struct {
 	size:                       [2]f32, // screen size in GUI pixels
 	mouse:                      [2]f32, // in GUI pixels
 	clicked:                    bool,   // the left button went down this frame
+	held:                       bool,   // the left button is down
+	dragging:                   int,    // the slider being dragged, 0 for none
+	widgets:                    [dynamic]Widget, // every button and slider laid out this frame
+	missing_glyphs:             [dynamic]rune,   // letters some text asked for that the font doesn't have
+}
+
+// Where a button or slider ended up, so the self-test can press it by its label.
+Widget :: struct {
+	label:      string,
+	x, y, w, h: f32,
 }
 
 ui_init :: proc(ui: ^UI, blocks_texture: u32) -> bool {
@@ -117,14 +127,23 @@ gui_scale :: proc(width, height: i32) -> f32 {
 	return f32(max(1, min(width / 320, height / 240)))
 }
 
-// mouse is in screen pixels.
-ui_begin :: proc(ui: ^UI, width, height: i32, mouse: [2]f32, clicked: bool) {
+// mouse is in screen pixels. clicked: the left button went down this frame; held: it is down.
+ui_begin :: proc(ui: ^UI, width, height: i32, mouse: [2]f32, clicked: bool, held := false) {
 	ui.scale = gui_scale(width, height)
 	ui.screen = {f32(width), f32(height)}
 	ui.size = ui.screen / ui.scale
 	ui.mouse = mouse / ui.scale
 	ui.clicked = clicked
+	ui.held = held || clicked
+	if !ui.held {
+		ui.dragging = 0
+	}
 	clear(&ui.vertices)
+	clear(&ui.widgets)
+}
+
+ui_hovered :: proc(ui: ^UI, x, y, w, h: f32) -> bool {
+	return ui.mouse.x >= x && ui.mouse.x < x + w && ui.mouse.y >= y && ui.mouse.y < y + h
 }
 
 ui_quad :: proc(ui: ^UI, x, y, w, h: f32, uv0, uv1: [2]f32, color: Color) {
@@ -178,43 +197,83 @@ ui_block_icon :: proc(ui: ^UI, block: Block, center: [2]f32) {
 }
 
 // x, y is the top-left corner of the capitals. A dark copy one pixel down-right gives the Minecraft shadow.
-ui_text :: proc(ui: ^UI, text: string, x, y: f32, color: Color, shadow := true) {
+// size blows every font pixel up into a size x size square, for titles.
+ui_text :: proc(ui: ^UI, text: string, x, y: f32, color: Color, shadow := true, size: f32 = 1) {
 	if shadow {
-		ui_text_raw(ui, text, x + 1, y + 1, {color.r / 4, color.g / 4, color.b / 4, color.a})
+		ui_text_raw(ui, text, x + size, y + size, {color.r / 4, color.g / 4, color.b / 4, color.a}, size)
 	}
-	ui_text_raw(ui, text, x, y, color)
+	ui_text_raw(ui, text, x, y, color, size)
 }
 
-ui_text_raw :: proc(ui: ^UI, text: string, x, y: f32, color: Color) {
+ui_text_raw :: proc(ui: ^UI, text: string, x, y: f32, color: Color, size: f32 = 1) {
 	pen := x
 	for r in text {
 		if r == ' ' {
-			pen += FONT_SPACE_WIDTH + 1
+			pen += (FONT_SPACE_WIDTH + 1) * size
 			continue
 		}
-		g, _ := font_glyph(&ui.font, r)
+		g, ok := font_glyph(&ui.font, r)
+		if !ok && !slice.contains(ui.missing_glyphs[:], r) {
+			append(&ui.missing_glyphs, r)
+		}
 		cell_x, cell_y := f32(g.cell % FONT_COLUMNS * FONT_CELL_W), f32(g.cell / FONT_COLUMNS * FONT_CELL_H)
 		uv0 := [2]f32{cell_x / FONT_ATLAS_W, cell_y / FONT_ATLAS_H}
 		uv1 := [2]f32{(cell_x + FONT_CELL_W) / FONT_ATLAS_W, (cell_y + FONT_CELL_H) / FONT_ATLAS_H}
-		ui_quad(ui, pen, y, FONT_CELL_W, FONT_CELL_H, uv0, uv1, color)
-		pen += f32(g.width + 1)
+		ui_quad(ui, pen, y, FONT_CELL_W * size, FONT_CELL_H * size, uv0, uv1, color)
+		pen += f32(g.width + 1) * size
 	}
 }
 
-ui_text_centered :: proc(ui: ^UI, text: string, center_x, y: f32, color: Color) {
-	ui_text(ui, text, math.floor(center_x - f32(font_text_width(&ui.font, text)) / 2), y, color)
+ui_text_centered :: proc(ui: ^UI, text: string, center_x, y: f32, color: Color, size: f32 = 1) {
+	ui_text(ui, text, math.floor(center_x - f32(font_text_width(&ui.font, text)) * size / 2), y, color, size = size)
 }
 
-// A Minecraft-style button: grey face with a light top edge and a dark bottom edge, bluish under the mouse.
-ui_button :: proc(ui: ^UI, label: string, x, y, w, h: f32) -> (clicked: bool) {
-	hover := ui.mouse.x >= x && ui.mouse.x < x + w && ui.mouse.y >= y && ui.mouse.y < y + h
-	face := Color{125, 130, 180, 255} if hover else Color{110, 110, 110, 255}
+// Grey face with a light top edge and a dark bottom edge, bluish when lit (under the mouse).
+ui_bevel :: proc(ui: ^UI, x, y, w, h: f32, lit: bool) {
+	face := Color{125, 130, 180, 255} if lit else Color{110, 110, 110, 255}
 	ui_rect(ui, x, y, w, h, {0, 0, 0, 255})
 	ui_rect(ui, x + 1, y + 1, w - 2, h - 2, face)
 	ui_rect(ui, x + 1, y + 1, w - 2, 1, {face.r + 40, face.g + 40, face.b + 40, 255})
 	ui_rect(ui, x + 1, y + h - 2, w - 2, 1, {face.r / 2, face.g / 2, face.b / 2, 255})
-	ui_text_centered(ui, label, x + w / 2, y + math.floor((h - FONT_CAP_HEIGHT) / 2), HOVER_TEXT if hover else WHITE)
+}
+
+ui_label :: proc(ui: ^UI, label: string, x, y, w, h: f32, lit: bool) {
+	ui_text_centered(ui, label, x + w / 2, y + math.floor((h - FONT_CAP_HEIGHT) / 2), HOVER_TEXT if lit else WHITE)
+}
+
+// A Minecraft-style button.
+ui_button :: proc(ui: ^UI, label: string, x, y, w, h: f32) -> (clicked: bool) {
+	append(&ui.widgets, Widget{label, x, y, w, h})
+	hover := ui_hovered(ui, x, y, w, h) && ui.dragging == 0
+	ui_bevel(ui, x, y, w, h, hover)
+	ui_label(ui, label, x, y, w, h, hover)
 	return hover && ui.clicked
+}
+
+SLIDER_HANDLE_W :: 8
+
+// A Minecraft-style slider: a dark groove with a button for a handle. Click anywhere on it or drag;
+// the value follows the mouse while the button is held, even off the slider. id tells sliders apart
+// and must not be 0. Returns true when the value changed.
+ui_slider :: proc(ui: ^UI, id: int, label: string, value: ^int, range: [2]int, x, y, w, h: f32) -> (changed: bool) {
+	append(&ui.widgets, Widget{label, x, y, w, h})
+	hover := ui_hovered(ui, x, y, w, h)
+	if hover && ui.clicked {
+		ui.dragging = id
+	}
+	if ui.dragging == id {
+		t := clamp((ui.mouse.x - x - SLIDER_HANDLE_W / 2) / (w - SLIDER_HANDLE_W), 0, 1)
+		v := range[0] + int(math.round(t * f32(range[1] - range[0])))
+		changed = v != value^
+		value^ = v
+	}
+	lit := ui.dragging == id || (hover && ui.dragging == 0)
+	ui_rect(ui, x, y, w, h, {0, 0, 0, 255})
+	ui_rect(ui, x + 1, y + 1, w - 2, h - 2, {50, 50, 50, 255})
+	t := f32(value^ - range[0]) / f32(range[1] - range[0])
+	ui_bevel(ui, x + math.floor(t * (w - SLIDER_HANDLE_W)), y, SLIDER_HANDLE_W, h, lit)
+	ui_label(ui, label, x, y, w, h, lit)
+	return
 }
 
 // Draws everything queued since ui_begin on top of the frame.
@@ -239,39 +298,4 @@ ui_end :: proc(ui: ^UI) {
 	gl.Disable(gl.BLEND)
 	gl.Enable(gl.CULL_FACE)
 	gl.Enable(gl.DEPTH_TEST)
-}
-
-Menu_Action :: enum {
-	None,
-	Resume,
-	Next_Display_Mode,
-	Quit,
-}
-
-// The Esc menu: the world stays visible, dimmed, behind it. The FPS corner is left out when the F3 screen
-// already shows it.
-pause_menu :: proc(ui: ^UI, display: Display_Mode, fps: int, show_fps := true) -> (action: Menu_Action) {
-	ui_rect(ui, 0, 0, ui.size.x, ui.size.y, {0, 0, 0, 140})
-	center := math.floor(ui.size.x / 2)
-	y := math.floor(ui.size.y / 4)
-	ui_text_centered(ui, "Пауза", center, y, WHITE)
-	x := center - BUTTON_W / 2
-	y += 20
-	if ui_button(ui, "Продолжить", x, y, BUTTON_W, BUTTON_H) {
-		action = .Resume
-	}
-	y += BUTTON_STEP
-	if ui_button(ui, fmt.tprintf("Экран: %s", DISPLAY_MODE_NAMES[display]), x, y, BUTTON_W, BUTTON_H) {
-		action = .Next_Display_Mode
-	}
-	y += BUTTON_STEP
-	if ui_button(ui, "Выйти из игры", x, y, BUTTON_W, BUTTON_H) {
-		action = .Quit
-	}
-	// Under the buttons, clear of the hotbar at the bottom of the screen.
-	ui_text_centered(ui, "Esc — вернуться в игру     F11 — полный экран", center, y + BUTTON_H + 16, HINT_TEXT)
-	if show_fps {
-		ui_text(ui, fmt.tprintf("%d FPS", fps), 4, 4, WHITE)
-	}
-	return
 }

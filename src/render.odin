@@ -15,9 +15,12 @@ Chunk_Mesh :: struct {
 }
 
 Renderer :: struct {
+	fov:              f32, // degrees, top to bottom of the screen
+	render_distance:  f64, // blocks: nothing further away is drawn, and land fades into the dark before it
 	program:          u32,
 	u_view_proj:      i32,
 	u_chunk_offset:   i32,
+	u_fog:            i32,
 	texture:          u32,
 	quad_ebo:         u32,
 	star_program:     u32,
@@ -63,29 +66,46 @@ uniform vec3 u_chunk_offset; // chunk anchor relative to the camera
 out vec2 v_uv;
 flat out float v_layer;
 out float v_shade;
+out float v_distance;
 
 void main() {
-	gl_Position = u_view_proj * vec4(a_pos + u_chunk_offset, 1.0);
+	vec3 pos = a_pos + u_chunk_offset;
+	gl_Position = u_view_proj * vec4(pos, 1.0);
 	v_uv = a_info.xy;
 	v_layer = a_info.z;
 	v_shade = a_info.w / 255.0;
+	v_distance = length(pos);
 }
 `
 
+// Land fades into the colour of space over the last part of the render distance,
+// so the edge of what is drawn never shows as a hard line.
 FRAGMENT_SHADER :: `#version 330 core
 in vec2 v_uv;
 flat in float v_layer;
 in float v_shade;
+in float v_distance;
 
 uniform sampler2DArray u_texture;
+uniform vec2 u_fog; // where the fading starts and where it is complete, in blocks
 
 out vec4 frag_color;
 
 void main() {
-	vec3 color = texture(u_texture, vec3(v_uv, v_layer)).rgb;
-	frag_color = vec4(color * v_shade, 1.0);
+	vec3 color = texture(u_texture, vec3(v_uv, v_layer)).rgb * v_shade;
+	float fog = smoothstep(u_fog.x, u_fog.y, v_distance);
+	frag_color = vec4(mix(color, vec3(` + SPACE_COLOR_GLSL + `), fog), 1.0);
 }
 `
+
+// SPACE_COLOR written for the shader.
+SPACE_COLOR_GLSL :: "0.01, 0.01, 0.025"
+
+// The fading starts at this share of the render distance.
+FOG_START :: 0.8
+
+// Far enough that nothing on or around the planet is ever cut off.
+UNLIMITED_DISTANCE :: 1e9
 
 STAR_VERTEX_SHADER :: `#version 330 core
 layout(location = 0) in vec3 a_dir;
@@ -125,6 +145,10 @@ renderer_init :: proc(r: ^Renderer) -> bool {
 	r.program = program
 	r.u_view_proj = gl.GetUniformLocation(program, "u_view_proj")
 	r.u_chunk_offset = gl.GetUniformLocation(program, "u_chunk_offset")
+	r.u_fog = gl.GetUniformLocation(program, "u_fog")
+	// The benchmark and the self-test always see the whole planet with the standard view.
+	r.fov = f32(DEFAULT_SETTINGS.fov)
+	r.render_distance = UNLIMITED_DISTANCE
 
 	star_program, star_ok := gl.load_shaders_source(STAR_VERTEX_SHADER, STAR_FRAGMENT_SHADER)
 	if !star_ok {
@@ -301,11 +325,16 @@ renderer_draw :: proc(r: ^Renderer, w: ^World, view_proj: matrix[4, 4]f32, camer
 	gl.Enable(gl.DEPTH_TEST)
 	gl.UseProgram(r.program)
 	gl.UniformMatrix4fv(r.u_view_proj, 1, false, &view_proj[0, 0])
+	gl.Uniform2f(r.u_fog, f32(r.render_distance * FOG_START), f32(r.render_distance))
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D_ARRAY, r.texture)
 	planes := frustum_planes(view_proj)
 	for _, chunk in w.chunks {
 		if chunk.mesh.index_count == 0 {
+			continue
+		}
+		// Past the render distance everything would be fully faded anyway.
+		if linalg.length(chunk.center - camera_pos) - chunk.radius > r.render_distance {
 			continue
 		}
 		when !NO_CULLING {

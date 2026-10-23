@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import gl "vendor:OpenGL"
 import "vendor:glfw"
@@ -228,6 +229,7 @@ run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, ui: ^UI, w: ^Worl
 
 	test_interface(&log, window, r, ui, w)
 	test_hud(&log, window, r, ui, w)
+	test_options(&log, window, r, ui, w)
 
 	fmt.sbprintf(&log.text, "\n%s\n", "ALL PASSED" if log.failed == 0 else fmt.tprintf("%d FAILED", log.failed))
 	report := strings.to_string(log.text)
@@ -255,17 +257,39 @@ test_interface :: proc(log: ^Test_Log, window: glfw.WindowHandle, r: ^Renderer, 
 	missing := font_missing(&ui.font, ALPHABETS)
 	test_check(log, missing == "", "font has every letter", fmt.tprintf("%d glyphs, missing: \"%s\"", len(ui.font.glyphs), missing))
 
-	// Render the pause menu once off-screen to collect its text, and check every character is drawable.
 	width, height := glfw.GetFramebufferSize(window)
-	menu_text := strings.builder_make(context.temp_allocator)
+	size := [2]i32{width, height}
+	cam := spawn_camera()
+
+	// Every menu in every state it can be in, laid out off-screen: the font must have every letter they use.
+	clear(&ui.missing_glyphs)
+	s := DEFAULT_SETTINGS
+	ui_begin(ui, width, height, {-1, -1}, false)
+	main_menu(ui)
+	pause_menu(ui, 60)
 	for mode in Display_Mode {
-		fmt.sbprintf(&menu_text, "Пауза Продолжить Экран: %s Выйти из игры Esc — вернуться в игру F11 — полный экран 60 FPS ", DISPLAY_MODE_NAMES[mode])
+		for vsync in ([2]bool{true, false}) {
+			s.display, s.vsync = mode, vsync
+			options_menu(ui, &s)
+		}
 	}
-	missing = font_missing(&ui.font, strings.to_string(menu_text))
-	test_check(log, missing == "", "font covers the menu text", fmt.tprintf("missing: \"%s\"", missing))
+	for n in ([?]int{1, 2, 5, 11, 21, 32}) {
+		s.render_distance = n
+		options_menu(ui, &s)
+	}
+	// With the mouse on each setting in turn, for its hint.
+	s = DEFAULT_SETTINGS
+	ui_begin(ui, width, height, {-1, -1}, false)
+	options_menu(ui, &s)
+	rows := slice.clone(ui.widgets[:], context.temp_allocator)
+	for row in rows {
+		ui_begin(ui, width, height, [2]f32{row.x + row.w / 2, row.y + row.h / 2} * ui.scale, false)
+		options_menu(ui, &s)
+	}
+	clear(&ui.vertices)
+	test_check(log, len(ui.missing_glyphs) == 0, "font covers every menu", fmt.tprintf("missing: %v", ui.missing_glyphs[:]))
 
 	// The whole font on a dark background, for a look.
-	cam := spawn_camera()
 	draw_frame(window, r, w, cam)
 	ui_begin(ui, width, height, {-1, -1}, false)
 	ui_rect(ui, 0, 0, ui.size.x, ui.size.y, {20, 20, 30, 255})
@@ -274,7 +298,7 @@ test_interface :: proc(log: ^Test_Log, window: glfw.WindowHandle, r: ^Renderer, 
 		"abcdefghijklmnopqrstuvwxyz",
 		"АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ",
 		"абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
-		"0123456789 .,:;!?-—+=_()/%|'\"<>",
+		"0123456789 .,:;!?-—+=_()/%|'\"<>°",
 		"Съешь же ещё этих мягких французских булок, да выпей чаю.",
 		"The quick brown fox jumps over the lazy dog.",
 	}
@@ -285,45 +309,95 @@ test_interface :: proc(log: ^Test_Log, window: glfw.WindowHandle, r: ^Renderer, 
 	save_screenshot(window, "test_7.png")
 	glfw.SwapBuffers(window)
 
-	// Where the pause menu puts its buttons, in screen pixels (same layout as pause_menu).
-	ui.scale = gui_scale(width, height)
-	gui := [2]f32{f32(width), f32(height)} / ui.scale
-	center := math.floor(gui.x / 2)
-	first_button_y := math.floor(gui.y / 4) + 20
-	button_center :: proc(center, first_y: f32, index: int, scale: f32) -> [2]f32 {
-		return [2]f32{center, first_y + f32(index) * BUTTON_STEP + BUTTON_H / 2} * scale
-	}
-
-	// The pause menu over the world and the hotbar, with the mouse resting on the second button.
+	// The pause menu over the world and the hotbar, with the mouse resting on its second button.
+	ui_begin(ui, width, height, {-1, -1}, false)
+	pause_menu(ui, 60)
+	second, _ := widget_center(ui.widgets[:], ui.scale, "Настройки")
 	draw_frame(window, r, w, cam)
-	ui_begin(ui, width, height, button_center(center, first_button_y, 1, ui.scale), false)
+	ui_begin(ui, width, height, second, false)
 	hud_hotbar(ui, new_hotbar(), 0)
-	pause_menu(ui, .Windowed, 60)
+	pause_menu(ui, 60)
 	ui_end(ui)
 	save_screenshot(window, "test_8.png")
 	glfw.SwapBuffers(window)
 
 	// Clicks land on the right buttons, and a click on empty space does nothing.
-	clicks := [?]struct {
-		mouse: [2]f32,
+	Click :: struct {
+		menu:  Test_Menu,
+		label: string, // "" clicks empty space
 		want:  Menu_Action,
-	} {
-		{button_center(center, first_button_y, 0, ui.scale), .Resume},
-		{button_center(center, first_button_y, 1, ui.scale), .Next_Display_Mode},
-		{button_center(center, first_button_y, 2, ui.scale), .Quit},
-		{{2, 2}, .None},
 	}
-	all_right := true
-	got: [dynamic]Menu_Action
-	got.allocator = context.temp_allocator
+	clicks := [?]Click {
+		{.Main, "Играть", .Play},
+		{.Main, "Настройки", .Options},
+		{.Main, "Выйти из игры", .Quit},
+		{.Main, "", .None},
+		{.Pause, "Продолжить", .Resume},
+		{.Pause, "Настройки", .Options},
+		{.Pause, "В главное меню", .Main_Menu},
+		{.Pause, "", .None},
+		{.Options, "Синхронизация", .Toggle_Vsync},
+		{.Options, "Экран", .Next_Display_Mode},
+		{.Options, "Готово", .Done},
+		{.Options, "", .None},
+	}
+	wrong := strings.builder_make(context.temp_allocator)
 	for c in clicks {
-		ui_begin(ui, width, height, c.mouse, true)
-		action := pause_menu(ui, .Windowed, 60)
-		append(&got, action)
-		all_right &= action == c.want
+		s = DEFAULT_SETTINGS
+		if got := test_click(ui, size, c.menu, &s, c.label); got != c.want {
+			fmt.sbprintf(&wrong, "%v «%s» gave %v (want %v); ", c.menu, c.label, got, c.want)
+		}
 	}
 	clear(&ui.vertices)
-	test_check(log, all_right, "menu buttons", fmt.tprintf("clicks gave %v", got[:]))
+	test_check(log, strings.builder_len(wrong) == 0, "menu buttons",
+		fmt.tprintf("%d clicks on the main menu, the pause menu and the settings; %s", len(clicks), strings.to_string(wrong)))
+
+	// Sliders: a click sets the value where it lands, dragging follows the mouse even off the slider,
+	// and moving without the button held changes nothing.
+	s = DEFAULT_SETTINGS
+	ui_begin(ui, width, height, {-1, -1}, false)
+	options_menu(ui, &s)
+	layout := slice.clone(ui.widgets[:], context.temp_allocator)
+	at :: proc(layout: []Widget, scale: f32, label: string, t: f32, below: f32 = 0) -> [2]f32 {
+		for wd in layout {
+			if strings.has_prefix(wd.label, label) {
+				return {wd.x + SLIDER_HANDLE_W / 2 + t * (wd.w - SLIDER_HANDLE_W), wd.y + wd.h / 2 + below} * scale
+			}
+		}
+		return {-1, -1}
+	}
+	mouse :: proc(ui: ^UI, size: [2]i32, s: ^Settings, at: [2]f32, clicked: bool, held: bool) {
+		ui_begin(ui, size.x, size.y, at, clicked, held)
+		options_menu(ui, s)
+	}
+	nowhere := [2]f32{-1, -1}
+	scale := ui.scale
+	fov: [3]int
+	for t, i in ([3]f32{0, 1, 0.5}) {
+		mouse(ui, size, &s, at(layout, scale, "Поле зрения", t), true, true)
+		fov[i] = s.fov
+		mouse(ui, size, &s, nowhere, false, false)
+	}
+	sensitivity: [3]int
+	mouse(ui, size, &s, at(layout, scale, "Чувствительность", 0.2), true, true)
+	sensitivity[0] = s.sensitivity
+	mouse(ui, size, &s, at(layout, scale, "Чувствительность", 0.8, 40), false, true) // dragged, below the slider
+	sensitivity[1] = s.sensitivity
+	mouse(ui, size, &s, nowhere, false, false)
+	mouse(ui, size, &s, at(layout, scale, "Чувствительность", 0.5), false, false) // moved without holding
+	sensitivity[2] = s.sensitivity
+	mouse(ui, size, &s, at(layout, scale, "Дальность", 1), true, true)
+	far := s.render_distance
+	mouse(ui, size, &s, nowhere, false, false)
+	clear(&ui.vertices)
+	test_check(log, fov == [3]int{30, 110, 70} && sensitivity == [3]int{48, 162, 162} && far == RENDER_DISTANCE_RANGE[1], "sliders",
+		fmt.tprintf("field of view %v (want [30, 110, 70]), sensitivity %v (want [48, 162, 162]), render distance %d (want %d)",
+			fov, sensitivity, far, RENDER_DISTANCE_RANGE[1]))
+
+	half, standard, double := DEFAULT_SETTINGS, DEFAULT_SETTINGS, DEFAULT_SETTINGS
+	half.sensitivity, double.sensitivity = 50, 200
+	test_check(log, look_speed(standard) == MOUSE_SENSITIVITY && look_speed(half) == MOUSE_SENSITIVITY / 2 && look_speed(double) == MOUSE_SENSITIVITY * 2,
+		"mouse sensitivity", fmt.tprintf("turn per pixel at 50%%, 100%%, 200%%: %.5f, %.5f, %.5f", look_speed(half), look_speed(standard), look_speed(double)))
 
 	// Each display mode: borderless and full screen cover the whole monitor, windowed comes back to its size.
 	settings := DEFAULT_SETTINGS
@@ -356,12 +430,156 @@ test_interface :: proc(log: ^Test_Log, window: glfw.WindowHandle, r: ^Renderer, 
 	test_check(log, went_full && settings.display == .Windowed && [2]i32{fw, fh} == window_size, "F11",
 		fmt.tprintf("full screen %v, back in a window %v", went_full, [2]i32{fw, fh}))
 
-	// Settings survive a save and a load.
-	saved := Settings{.Borderless, .Borderless, {12, 34}, {800, 600}}
+	// Settings survive a save and a load; a file from an older version leaves the newer settings at their
+	// defaults; numbers out of range are pulled back in and nonsense is ignored.
+	saved := Settings {
+		display         = .Borderless,
+		last_full       = .Borderless,
+		window_pos      = {12, 34},
+		window_size     = {800, 600},
+		sensitivity     = 150,
+		fov             = 95,
+		vsync           = false,
+		render_distance = 7,
+	}
 	settings_save("test_settings.txt", saved)
 	loaded := settings_load("test_settings.txt")
+	_ = os.write_entire_file("test_settings.txt", "display=windowed\nlast_full=fullscreen\nwindow=100 100 1280 720\n")
+	old := settings_load("test_settings.txt")
+	_ = os.write_entire_file("test_settings.txt", "fov=500\nsensitivity=-3\nrender_distance=x\nvsync=maybe\n")
+	odd := settings_load("test_settings.txt")
 	_ = os.remove("test_settings.txt")
-	test_check(log, loaded == saved, "settings are remembered", fmt.tprintf("saved %v, loaded %v", saved, loaded))
+	odd_right := odd.fov == FOV_RANGE[1] && odd.sensitivity == SENSITIVITY_RANGE[0] &&
+		odd.render_distance == DEFAULT_SETTINGS.render_distance && odd.vsync == DEFAULT_SETTINGS.vsync
+	test_check(log, loaded == saved && old == DEFAULT_SETTINGS && odd_right, "settings are remembered",
+		fmt.tprintf("saved %v, loaded %v; a 0.0.7 file gives the defaults: %v; odd values give %v", saved, loaded, old == DEFAULT_SETTINGS, odd))
+}
+
+Test_Menu :: enum {
+	Main,
+	Pause,
+	Options,
+}
+
+test_draw_menu :: proc(ui: ^UI, menu: Test_Menu, s: ^Settings) -> Menu_Action {
+	switch menu {
+	case .Main:
+		return main_menu(ui)
+	case .Pause:
+		return pause_menu(ui, 60)
+	case .Options:
+		return options_menu(ui, s)
+	}
+	return .None
+}
+
+// The middle of the first button or slider whose label starts with `label`, in screen pixels.
+widget_center :: proc(widgets: []Widget, scale: f32, label: string) -> ([2]f32, bool) {
+	for wd in widgets {
+		if strings.has_prefix(wd.label, label) {
+			return [2]f32{wd.x + wd.w / 2, wd.y + wd.h / 2} * scale, true
+		}
+	}
+	return {}, false
+}
+
+// Lays the menu out once with the mouse away, then clicks the middle of the button labelled `label`
+// ("" clicks an empty corner) and returns what the menu did.
+test_click :: proc(ui: ^UI, size: [2]i32, menu: Test_Menu, s: ^Settings, label: string) -> Menu_Action {
+	ui_begin(ui, size.x, size.y, {-1, -1}, false)
+	test_draw_menu(ui, menu, s)
+	spot := [2]f32{2, 2}
+	if label != "" {
+		found: bool
+		if spot, found = widget_center(ui.widgets[:], ui.scale, label); !found {
+			return .None
+		}
+	}
+	ui_begin(ui, size.x, size.y, spot, true)
+	action := test_draw_menu(ui, menu, s)
+	ui_begin(ui, size.x, size.y, {-1, -1}, false) // let go
+	return action
+}
+
+// The settings at work: a wider view draws more of the world, a shorter render distance draws less,
+// and vsync holds the frame rate to the screen. Plus pictures of the main menu, the settings, and the
+// world fading out at a short render distance.
+test_options :: proc(log: ^Test_Log, window: glfw.WindowHandle, r: ^Renderer, ui: ^UI, w: ^World) {
+	width, height := glfw.GetFramebufferSize(window)
+	cam := spawn_camera()
+	drawn_with :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World, cam: Camera, fov: int, distance: f64) -> int {
+		r.fov, r.render_distance = f32(fov), distance
+		drawn, _ := draw_frame(window, r, w, cam)
+		return drawn
+	}
+	fovs := [3]int {
+		drawn_with(window, r, w, cam, 30, UNLIMITED_DISTANCE),
+		drawn_with(window, r, w, cam, 70, UNLIMITED_DISTANCE),
+		drawn_with(window, r, w, cam, 110, UNLIMITED_DISTANCE),
+	}
+	test_check(log, fovs[0] < fovs[1] && fovs[1] < fovs[2], "field of view", fmt.tprintf("chunks drawn at 30°, 70°, 110°: %v", fovs))
+
+	// From 20 blocks above the start, where much of the planet is in view.
+	high := cam
+	high.pos += linalg.normalize(high.pos) * 20
+	distances := [3]int {
+		drawn_with(window, r, w, high, 70, 2 * CHUNK_SIZE),
+		drawn_with(window, r, w, high, 70, 8 * CHUNK_SIZE),
+		drawn_with(window, r, w, high, 70, 32 * CHUNK_SIZE),
+	}
+	test_check(log, distances[0] < distances[1] && distances[1] < distances[2], "render distance",
+		fmt.tprintf("chunks drawn at 2, 8, 32 chunks: %v", distances))
+
+	// Twenty frames each way. With vsync a frame waits for the screen; without, it is done in a few ms.
+	time_frames :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World, cam: Camera, count: int) -> f64 {
+		start := glfw.GetTime()
+		for _ in 0 ..< count {
+			draw_frame(window, r, w, cam)
+			glfw.SwapBuffers(window)
+		}
+		return (glfw.GetTime() - start) / f64(count)
+	}
+	r.fov, r.render_distance = f32(DEFAULT_SETTINGS.fov), UNLIMITED_DISTANCE
+	refresh := f64(glfw.GetVideoMode(glfw.GetPrimaryMonitor()).refresh_rate)
+	synced := DEFAULT_SETTINGS
+	apply_vsync(synced)
+	time_frames(window, r, w, cam, 5)
+	with_vsync := time_frames(window, r, w, cam, 20)
+	synced.vsync = false
+	apply_vsync(synced)
+	time_frames(window, r, w, cam, 5)
+	without := time_frames(window, r, w, cam, 20)
+	test_check(log, with_vsync > 0.8 / refresh && without < with_vsync / 2, "vsync",
+		fmt.tprintf("a frame takes %.1f ms with vsync (screen %.0f Hz), %.1f ms without", with_vsync * 1000, refresh, without * 1000))
+
+	// The main menu over the turning planet, with the mouse on "Играть".
+	s := DEFAULT_SETTINGS
+	ui_begin(ui, width, height, {-1, -1}, false)
+	main_menu(ui)
+	play, _ := widget_center(ui.widgets[:], ui.scale, "Играть")
+	draw_frame(window, r, w, title_camera(30))
+	ui_begin(ui, width, height, play, false)
+	main_menu(ui)
+	ui_end(ui)
+	save_screenshot(window, "test_10.png")
+	glfw.SwapBuffers(window)
+
+	// The settings over the game, with the mouse on vsync and its hint showing.
+	ui_begin(ui, width, height, {-1, -1}, false)
+	options_menu(ui, &s)
+	vsync, _ := widget_center(ui.widgets[:], ui.scale, "Синхронизация")
+	draw_frame(window, r, w, cam)
+	ui_begin(ui, width, height, vsync, false)
+	hud_hotbar(ui, new_hotbar(), 0)
+	options_menu(ui, &s)
+	ui_end(ui)
+	save_screenshot(window, "test_11.png")
+	glfw.SwapBuffers(window)
+
+	// The start at a render distance of 4 chunks: the land fades into the dark 50-64 blocks away.
+	r.render_distance = 4 * CHUNK_SIZE
+	test_screenshot(window, r, w, cam, 12)
+	r.render_distance = UNLIMITED_DISTANCE
 }
 
 // The hotbar and the F3 screen: picking blocks with keys and the wheel, the name that fades,

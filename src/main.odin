@@ -11,7 +11,7 @@ import "vendor:glfw"
 import stbi "vendor:stb/image"
 
 GAME_NAME :: "blockgame"
-VERSION   :: "0.0.7"
+VERSION   :: "0.0.8"
 
 WINDOW_WIDTH  :: 1280
 WINDOW_HEIGHT :: 720
@@ -21,7 +21,6 @@ SPACE_COLOR :: [3]f32{0.01, 0.01, 0.025}
 // Start standing in the middle of the top face, looking out a little below the horizon.
 SPAWN_PITCH :: -0.1
 
-FOV_DEGREES        :: 70.0
 NEAR_PLANE         :: 0.05
 FAR_PLANE          :: 2000.0
 FLY_SPEED          :: 11.0 // blocks per second
@@ -32,6 +31,24 @@ DOUBLE_TAP_SECONDS :: 0.3  // two jump presses this close together switch flying
 Key_State :: struct {
 	jump_was_down:   bool,
 	last_jump_press: f64,
+}
+
+// The mouse in play: where it was last frame, and the buttons that break and place blocks.
+Mouse_State :: struct {
+	last:                     [2]f64,
+	break_down, place_down:   bool,
+	break_timer, place_timer: f64,
+}
+
+// While playing the mouse turns the view and its pointer is hidden; in menus the pointer comes back.
+// Going back to play, mouse buttons already held don't count as a click in the world.
+go_to :: proc(window: glfw.WindowHandle, screen: ^Screen, to: Screen, mouse: ^Mouse_State) {
+	screen^ = to
+	glfw.SetInputMode(window, glfw.CURSOR, glfw.CURSOR_DISABLED if to == .Playing else glfw.CURSOR_NORMAL)
+	if to == .Playing {
+		mouse.last.x, mouse.last.y = glfw.GetCursorPos(window)
+		mouse.break_down, mouse.place_down = true, true
+	}
 }
 
 // Mouse wheel movement since it was last read; GLFW reports it through a callback.
@@ -89,7 +106,7 @@ main :: proc() {
 	gl.load_up_to(3, 3, glfw.gl_set_proc_address)
 
 	if playing {
-		glfw.SwapInterval(1)
+		apply_vsync(settings)
 		// Start as the remembered window, then switch to the remembered mode.
 		glfw.SetWindowPos(window, settings.window_pos.x, settings.window_pos.y)
 		start_mode := settings.display
@@ -137,25 +154,15 @@ main :: proc() {
 	keys := Key_State{last_jump_press = -1}
 	hotbar := new_hotbar()
 	looked_at: Ray_Hit
-	break_down, place_down: bool
-	break_timer, place_timer: f64
-	paused := false
+	mouse: Mouse_State
+	// The game opens on the main menu; the benchmark goes straight to play.
+	screen := Screen.Playing
+	options_from: Screen // where the settings go back to
 	// The benchmark keeps the F3 screen on, so its cost is part of the measurement.
 	show_debug := bench
 	escape_was_down, f11_was_down, f3_was_down, click_was_down: bool
-
-	last_mouse_x, last_mouse_y := glfw.GetCursorPos(window)
-	// While playing the mouse turns the view and its pointer is hidden; on pause the pointer comes back.
-	// Coming back from pause, mouse buttons already held don't count as a click in the world.
-	set_paused :: proc(window: glfw.WindowHandle, paused: bool, last_mouse_x, last_mouse_y: ^f64, break_down, place_down: ^bool) {
-		glfw.SetInputMode(window, glfw.CURSOR, glfw.CURSOR_NORMAL if paused else glfw.CURSOR_DISABLED)
-		if !paused {
-			last_mouse_x^, last_mouse_y^ = glfw.GetCursorPos(window)
-			break_down^, place_down^ = true, true
-		}
-	}
 	if playing {
-		set_paused(window, false, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
+		go_to(window, &screen, .Main_Menu, &mouse)
 	}
 
 	last_time := glfw.GetTime()
@@ -185,11 +192,20 @@ main :: proc() {
 				break
 			}
 			bench_fly(&camera, bench_time)
-		} else {
+		}
+		// What happens this frame besides play: from Esc, from losing the window, or from a menu button.
+		action := Menu_Action.None
+		if !bench {
 			escape, f11, f3 := key_down(window, glfw.KEY_ESCAPE), key_down(window, glfw.KEY_F11), key_down(window, glfw.KEY_F3)
 			if escape && !escape_was_down {
-				paused = !paused
-				set_paused(window, paused, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
+				#partial switch screen {
+				case .Playing:
+					action = .Pause
+				case .Paused:
+					action = .Resume
+				case .Options:
+					action = .Done
+				}
 			}
 			if f11 && !f11_was_down {
 				toggle_full_screen(window, &settings)
@@ -199,22 +215,22 @@ main :: proc() {
 			}
 			escape_was_down, f11_was_down, f3_was_down = escape, f11, f3
 			// Like Minecraft: switching to another program pauses the game.
-			if !paused && glfw.GetWindowAttrib(window, glfw.FOCUSED) == 0 {
-				paused = true
-				set_paused(window, paused, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
+			if screen == .Playing && glfw.GetWindowAttrib(window, glfw.FOCUSED) == 0 {
+				action = .Pause
 			}
 		}
 
-		// Wheel turns made in the pause menu don't count once the game goes on.
+		// Wheel turns made in a menu don't count once the game goes on.
 		wheel := wheel_moved
 		wheel_moved = 0
 
-		if !bench && !paused {
+		if !bench && screen == .Playing {
 			mouse_x, mouse_y := glfw.GetCursorPos(window)
-			camera_turn(&camera, f32(mouse_x - last_mouse_x) * MOUSE_SENSITIVITY)
-			camera.pitch -= f32(mouse_y - last_mouse_y) * MOUSE_SENSITIVITY
+			speed := look_speed(settings)
+			camera_turn(&camera, f32(mouse_x - mouse.last.x) * speed)
+			camera.pitch -= f32(mouse_y - mouse.last.y) * speed
 			camera.pitch = clamp(camera.pitch, -PITCH_LIMIT, PITCH_LIMIT)
-			last_mouse_x, last_mouse_y = mouse_x, mouse_y
+			mouse.last = {mouse_x, mouse_y}
 			// A long hitch (dragging the window) must not throw the player across the map.
 			player_update(&world, &player, camera.heading, read_input(window, &keys), min(dt, 0.1))
 			camera.pos = player_eye(player)
@@ -229,10 +245,10 @@ main :: proc() {
 			looked_at = raycast(&world, camera.pos, look_direction(camera))
 			breaking := glfw.GetMouseButton(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
 			placing := glfw.GetMouseButton(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
-			if button_fires(breaking, &break_down, &break_timer, dt) && looked_at.hit {
+			if button_fires(breaking, &mouse.break_down, &mouse.break_timer, dt) && looked_at.hit {
 				try_break(&world, &renderer, looked_at.block)
 			}
-			if button_fires(placing, &place_down, &place_timer, dt) && looked_at.hit {
+			if button_fires(placing, &mouse.place_down, &mouse.place_timer, dt) && looked_at.hit {
 				place_selected(&world, &renderer, player, looked_at.before, hotbar)
 			}
 			// Look again, so the outline already sits on what the edit left behind.
@@ -248,8 +264,15 @@ main :: proc() {
 			fps_frames, fps_timer, slowest_frame = 0, 0, 0
 		}
 
-		target: Maybe(Block_Pos) = looked_at.block if looked_at.hit && !paused else nil
-		drawn, ok := draw_frame(window, &renderer, &world, camera, target, playing && !paused)
+		// Behind the main menu, and its settings, the planet turns in space; otherwise the camera shows the game.
+		on_title := screen == .Main_Menu || (screen == .Options && options_from == .Main_Menu)
+		view := title_camera(now) if on_title else camera
+		if playing {
+			renderer.fov = f32(DEFAULT_SETTINGS.fov) if on_title else f32(settings.fov)
+			renderer.render_distance = UNLIMITED_DISTANCE if on_title else f64(settings.render_distance * CHUNK_SIZE)
+		}
+		target: Maybe(Block_Pos) = looked_at.block if looked_at.hit && screen == .Playing else nil
+		drawn, ok := draw_frame(window, &renderer, &world, view, target, playing && screen == .Playing)
 		if !ok {
 			// Minimized: sleep until something happens instead of spinning the CPU.
 			glfw.WaitEvents()
@@ -261,9 +284,11 @@ main :: proc() {
 
 		click := glfw.GetMouseButton(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
 		width, height := glfw.GetFramebufferSize(window)
-		ui_begin(&ui, width, height, mouse_in_pixels(window), click && !click_was_down)
-		hud_hotbar(&ui, hotbar, now)
-		if show_debug {
+		ui_begin(&ui, width, height, mouse_in_pixels(window), click && !click_was_down, click)
+		if !on_title {
+			hud_hotbar(&ui, hotbar, now)
+		}
+		if show_debug && !on_title {
 			looking: Block = .Air
 			if looked_at.hit {
 				looking = world_get_block(&world, looked_at.block.face, looked_at.block.x, looked_at.block.y, looked_at.block.z)
@@ -283,19 +308,44 @@ main :: proc() {
 			})
 		}
 		// Over the hotbar and the F3 screen, which stay visible, dimmed, behind the menu.
-		if paused {
-			switch pause_menu(&ui, settings.display, fps, show_fps = !show_debug) {
-			case .Resume:
-				paused = false
-				set_paused(window, paused, &last_mouse_x, &last_mouse_y, &break_down, &place_down)
-			case .Next_Display_Mode:
-				apply_display_mode(window, &settings, next_display_mode(settings.display))
-			case .Quit:
-				glfw.SetWindowShouldClose(window, true)
-			case .None:
-			}
+		pressed := Menu_Action.None
+		#partial switch screen {
+		case .Main_Menu:
+			pressed = main_menu(&ui)
+		case .Paused:
+			pressed = pause_menu(&ui, fps, show_fps = !show_debug)
+		case .Options:
+			pressed = options_menu(&ui, &settings)
+		}
+		if pressed != .None {
+			action = pressed
 		}
 		ui_end(&ui)
+
+		switch action {
+		case .Play, .Resume:
+			go_to(window, &screen, .Playing, &mouse)
+		case .Pause:
+			go_to(window, &screen, .Paused, &mouse)
+		case .Options:
+			options_from = screen
+			go_to(window, &screen, .Options, &mouse)
+		case .Main_Menu:
+			go_to(window, &screen, .Main_Menu, &mouse)
+		case .Quit:
+			glfw.SetWindowShouldClose(window, true)
+		case .Toggle_Vsync:
+			settings.vsync = !settings.vsync
+			apply_vsync(settings)
+		case .Next_Display_Mode:
+			apply_display_mode(window, &settings, next_display_mode(settings.display))
+		case .Done:
+			// Saved straight away, so the new settings survive even if the game is closed in an odd way.
+			remember_window(window, &settings)
+			settings_save(path, settings)
+			go_to(window, &screen, options_from, &mouse)
+		case .None:
+		}
 		click_was_down = click
 
 		glfw.SwapBuffers(window)
@@ -348,7 +398,7 @@ draw_frame :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World, cam: Came
 	gl.ClearColor(SPACE_COLOR.r, SPACE_COLOR.g, SPACE_COLOR.b, 1)
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 	aspect := f32(width) / f32(height)
-	projection := linalg.matrix4_perspective_f32(math.to_radians(f32(FOV_DEGREES)), aspect, NEAR_PLANE, FAR_PLANE)
+	projection := linalg.matrix4_perspective_f32(math.to_radians(r.fov), aspect, NEAR_PLANE, FAR_PLANE)
 	view_proj := projection * camera_view(cam)
 	drawn = renderer_draw(r, w, view_proj, cam.pos)
 	if pos, has_target := target.?; has_target {
