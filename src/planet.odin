@@ -15,6 +15,9 @@ SOIL_DEPTH :: 3 // dirt layers under the grass; stone below
 MIN_HEIGHT :: -8
 MAX_HEIGHT :: 48
 
+// Rock goes down to this layer, 64 blocks below the base radius; under it is the unbreakable molten core.
+CORE_TOP :: -64
+
 Cube_Face :: enum i32 {
 	PX,
 	NX,
@@ -126,6 +129,8 @@ column_block :: proc(c: Column, layer: i32) -> Block {
 	switch {
 	case layer > c.height:
 		return .Air
+	case layer < CORE_TOP:
+		return .Core
 	case c.rocky || layer < c.height - SOIL_DEPTH:
 		return .Stone
 	case layer == c.height:
@@ -134,36 +139,60 @@ column_block :: proc(c: Column, layer: i32) -> Block {
 	return .Dirt
 }
 
+Chunk_Columns :: [CHUNK_SIZE][CHUNK_SIZE]Column
+
+chunk_columns :: proc(face: Cube_Face, cx, cz: i32) -> (columns: Chunk_Columns) {
+	for z in i32(0) ..< CHUNK_SIZE {
+		for x in i32(0) ..< CHUNK_SIZE {
+			columns[z][x] = terrain_column(face, cx * CHUNK_SIZE + x, cz * CHUNK_SIZE + z)
+		}
+	}
+	return
+}
+
+fill_chunk :: proc(chunk: ^Chunk, columns: ^Chunk_Columns) {
+	for y in i32(0) ..< CHUNK_SIZE {
+		layer := chunk.pos.y * CHUNK_SIZE + y
+		for z in i32(0) ..< CHUNK_SIZE {
+			for x in i32(0) ..< CHUNK_SIZE {
+				chunk.blocks[block_index(x, y, z)] = column_block(columns[z][x], layer)
+			}
+		}
+	}
+}
+
+// Makes a chunk from the terrain formula; the same chunk always comes out the same.
+world_generate_chunk :: proc(w: ^World, pos: Chunk_Pos) -> ^Chunk {
+	chunk := world_new_chunk(w, pos)
+	columns := chunk_columns(pos.face, pos.x, pos.z)
+	fill_chunk(chunk, &columns)
+	return chunk
+}
+
+// Generates every chunk from a common floor up to the land surface. Deeper rock is made only once
+// someone digs into it.
 generate_planet :: proc(w: ^World) {
 	// Every column starts from the same floor, so a cliff above a low valley is never missing its lower part.
 	floor_chunk := i32(MIN_HEIGHT - SOIL_DEPTH - 1) >> CHUNK_SHIFT
 	peak := i32(min(i32))
-	columns: [CHUNK_SIZE][CHUNK_SIZE]Column
 	for face in Cube_Face {
 		for cz in i32(0) ..< FACE_CHUNKS {
 			for cx in i32(0) ..< FACE_CHUNKS {
+				columns := chunk_columns(face, cx, cz)
 				top := i32(min(i32))
 				for z in i32(0) ..< CHUNK_SIZE {
 					for x in i32(0) ..< CHUNK_SIZE {
-						gx, gz := cx * CHUNK_SIZE + x, cz * CHUNK_SIZE + z
-						c := terrain_column(face, gx, gz)
-						columns[z][x] = c
+						c := columns[z][x]
 						top = max(top, c.height)
 						if c.height > peak {
 							peak = c.height
-							w.highest_point = face_to_world(face, f64(gx) + 0.5, f64(gz) + 0.5, f64(c.height + 1))
+							u, v := f64(cx * CHUNK_SIZE + x) + 0.5, f64(cz * CHUNK_SIZE + z) + 0.5
+							w.highest_point = face_to_world(face, u, v, f64(c.height + 1))
 						}
 					}
 				}
 				for cy := floor_chunk; cy <= top >> CHUNK_SHIFT; cy += 1 {
-					chunk := world_new_chunk(w, Chunk_Pos{face, cx, cy, cz})
-					for y in i32(0) ..< CHUNK_SIZE {
-						for z in i32(0) ..< CHUNK_SIZE {
-							for x in i32(0) ..< CHUNK_SIZE {
-								chunk.blocks[block_index(x, y, z)] = column_block(columns[z][x], cy * CHUNK_SIZE + y)
-							}
-						}
-					}
+					fill_chunk(world_new_chunk(w, Chunk_Pos{face, cx, cy, cz}), &columns)
 				}
 			}
 		}

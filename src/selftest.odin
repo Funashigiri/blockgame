@@ -35,6 +35,16 @@ test_hold :: proc(w: ^World, p: ^Player, cam: ^Camera, input: Input, seconds: f6
 	}
 }
 
+// What the player would see, with crosshair and outline, saved as test_<n>.png.
+test_screenshot :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World, cam: Camera, n: int) {
+	hit := raycast(w, cam.pos, look_direction(cam))
+	target: Maybe(Block_Pos) = hit.block if hit.hit else nil
+	if _, ok := draw_frame(window, r, w, cam, target, true); ok {
+		save_screenshot(window, fmt.ctprintf("test_%d.png", n))
+		glfw.SwapBuffers(window)
+	}
+}
+
 feet_layer :: proc(p: Player) -> f64 {
 	_, grid := world_to_face(p.pos)
 	return grid.y
@@ -98,10 +108,7 @@ run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World) -> boo
 		}
 		if shots < 3 && t >= f64(20 + 60 * shots) {
 			shots += 1
-			if _, ok := draw_frame(window, r, w, cam); ok {
-				save_screenshot(window, fmt.ctprintf("test_%d.png", shots))
-				glfw.SwapBuffers(window)
-			}
+			test_screenshot(window, r, w, cam, shots)
 		}
 	}
 	test_check(&log, travelled >= 2 * math.PI, "walk a lap",
@@ -141,6 +148,71 @@ run_self_test :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World) -> boo
 	}
 	test_check(&log, len(toggles) == 1 && toggles[0] == 1.2, "double tap",
 		fmt.tprintf("switched at %v (want only at 1.2)", toggles[:]))
+
+	// Building, back at the start: put a block on the ground a couple of steps ahead.
+	p = spawn_player()
+	cam = spawn_camera()
+	test_hold(w, &p, &cam, {}, 1)
+	slowest_edit := 0.0
+	timed :: proc(slowest: ^f64, start: f64) {
+		slowest^ = max(slowest^, glfw.GetTime() - start)
+	}
+	cam.pitch = -0.6
+	hit := raycast(w, cam.pos, look_direction(cam))
+	start_time := glfw.GetTime()
+	placed := hit.hit && try_place(w, r, p, hit.before, .Planks)
+	timed(&slowest_edit, start_time)
+	there := world_get_block(w, hit.before.face, hit.before.x, hit.before.y, hit.before.z)
+	test_check(&log, placed && there == .Planks, "place a block",
+		fmt.tprintf("looking at %v, placed %v, block there now: %v", hit.block, placed, there))
+	up := linalg.normalize(p.pos)
+	own := block_at_world(p.pos + up * 0.5)
+	test_check(&log, !try_place(w, r, p, own, .Stone), "can't place a block inside yourself", fmt.tprintf("cell %v", own))
+
+	// A row of two-high pillars of every placeable block, for a look at the textures.
+	forward := linalg.normalize(([3]f64)(cam.heading))
+	right := linalg.cross(forward, up)
+	for block, i in PLACEABLE {
+		base := block_at_world(p.pos + forward * 4 + right * f64(i - 2) * 1.5 + up * 0.5)
+		for level in i32(0) ..< 2 {
+			start_time = glfw.GetTime()
+			try_place(w, r, p, {base.face, base.x, base.y + level, base.z}, block)
+			timed(&slowest_edit, start_time)
+		}
+	}
+	cam.pitch = -0.25
+	test_screenshot(window, r, w, cam, 4)
+
+	// Digging straight down: every block under the feet breaks, until the core, which doesn't.
+	cam.pitch = -PITCH_LIMIT
+	dug := 0
+	for _ in 0 ..< 200 {
+		hit = raycast(w, cam.pos, look_direction(cam))
+		if !hit.hit {
+			break
+		}
+		start_time = glfw.GetTime()
+		broke := try_break(w, r, hit.block)
+		timed(&slowest_edit, start_time)
+		if !broke {
+			break
+		}
+		dug += 1
+		test_hold(w, &p, &cam, {}, 0.6) // fall into the new hole and land
+	}
+	up = linalg.normalize(p.pos)
+	below := block_at_world(p.pos - up * 0.5)
+	standing_on := world_get_block(w, below.face, below.x, below.y, below.z)
+	test_check(&log, abs(feet_layer(p) - CORE_TOP) < 0.01 && standing_on == .Core, "dig down to the core",
+		fmt.tprintf("dug %d blocks, feet at layer %.2f (core starts below %d), standing on %v", dug, feet_layer(p), CORE_TOP, standing_on))
+	hit = raycast(w, cam.pos, look_direction(cam))
+	test_check(&log, hit.hit && !try_break(w, r, hit.block), "core can't be broken",
+		fmt.tprintf("looking at %v", BLOCK_NAMES[world_get_block(w, hit.block.face, hit.block.x, hit.block.y, hit.block.z)]))
+	cam.pitch = -0.9
+	test_screenshot(window, r, w, cam, 5)
+	cam.pitch = PITCH_LIMIT
+	test_screenshot(window, r, w, cam, 6)
+	test_check(&log, slowest_edit < 0.004, "edits are quick", fmt.tprintf("slowest break or place took %.2f ms", slowest_edit * 1000))
 
 	fmt.sbprintf(&log.text, "\n%s\n", "ALL PASSED" if log.failed == 0 else fmt.tprintf("%d FAILED", log.failed))
 	report := strings.to_string(log.text)

@@ -15,15 +15,43 @@ Chunk_Mesh :: struct {
 }
 
 Renderer :: struct {
-	program:         u32,
-	u_view_proj:     i32,
-	u_chunk_offset:  i32,
-	texture:         u32,
-	quad_ebo:        u32,
-	star_program:    u32,
+	program:          u32,
+	u_view_proj:      i32,
+	u_chunk_offset:   i32,
+	texture:          u32,
+	quad_ebo:         u32,
+	star_program:     u32,
 	u_star_view_proj: i32,
-	star_vao:        u32,
+	star_vao:         u32,
+	// Plain-coloured lines and shapes drawn over the world: the block outline and the crosshair.
+	overlay_program:  u32,
+	u_overlay_matrix: i32,
+	u_overlay_color:  i32,
+	overlay_vao:      u32,
+	overlay_vbo:      u32,
+	scratch:          [dynamic]Vertex, // reused while rebuilding a chunk mesh
 }
+
+OVERLAY_VERTEX_SHADER :: `#version 330 core
+layout(location = 0) in vec3 a_pos;
+uniform mat4 u_matrix;
+void main() {
+	gl_Position = u_matrix * vec4(a_pos, 1.0);
+}
+`
+
+OVERLAY_FRAGMENT_SHADER :: `#version 330 core
+uniform vec4 u_color;
+out vec4 frag_color;
+void main() {
+	frag_color = u_color;
+}
+`
+
+OVERLAY_MAX_VERTICES :: 32
+
+CROSSHAIR_ARM       :: 9 // pixels from the centre to the end of each arm
+CROSSHAIR_THICKNESS :: 1 // half the line thickness, in pixels
 
 VERTEX_SHADER :: `#version 330 core
 layout(location = 0) in vec3 a_pos;
@@ -105,6 +133,22 @@ renderer_init :: proc(r: ^Renderer) -> bool {
 	r.star_program = star_program
 	r.u_star_view_proj = gl.GetUniformLocation(star_program, "u_view_proj")
 
+	overlay_program, overlay_ok := gl.load_shaders_source(OVERLAY_VERTEX_SHADER, OVERLAY_FRAGMENT_SHADER)
+	if !overlay_ok {
+		return false
+	}
+	r.overlay_program = overlay_program
+	r.u_overlay_matrix = gl.GetUniformLocation(overlay_program, "u_matrix")
+	r.u_overlay_color = gl.GetUniformLocation(overlay_program, "u_color")
+	gl.GenVertexArrays(1, &r.overlay_vao)
+	gl.GenBuffers(1, &r.overlay_vbo)
+	gl.BindVertexArray(r.overlay_vao)
+	gl.BindBuffer(gl.ARRAY_BUFFER, r.overlay_vbo)
+	gl.BufferData(gl.ARRAY_BUFFER, OVERLAY_MAX_VERTICES * size_of([3]f32), nil, gl.DYNAMIC_DRAW)
+	gl.EnableVertexAttribArray(0)
+	gl.VertexAttribPointer(0, 3, gl.FLOAT, false, size_of([3]f32), 0)
+	gl.BindVertexArray(0)
+
 	// One index buffer shared by every chunk: quad i is vertices 4i..4i+3 as two triangles.
 	indices := make([]u16, MAX_QUADS_PER_CHUNK * 6, context.temp_allocator)
 	for q in 0 ..< MAX_QUADS_PER_CHUNK {
@@ -182,15 +226,17 @@ upload_chunk_mesh :: proc(r: ^Renderer, mesh: ^Chunk_Mesh, vertices: []Vertex) {
 	mesh.index_count = i32(len(vertices) / 4 * 6)
 }
 
+remesh_chunk :: proc(w: ^World, r: ^Renderer, chunk: ^Chunk) {
+	build_chunk_mesh(w, chunk, &r.scratch)
+	upload_chunk_mesh(r, &chunk.mesh, r.scratch[:])
+}
+
 // Builds and uploads every chunk; returns the number of block sides and of chunks that have any.
 mesh_world :: proc(w: ^World, r: ^Renderer) -> (sides, meshed_chunks: int) {
-	vertices := make([dynamic]Vertex, 0, 4096)
-	defer delete(vertices)
 	for _, chunk in w.chunks {
-		build_chunk_mesh(w, chunk, &vertices)
-		upload_chunk_mesh(r, &chunk.mesh, vertices[:])
-		sides += len(vertices) / 4
-		if len(vertices) > 0 {
+		remesh_chunk(w, r, chunk)
+		sides += len(r.scratch) / 4
+		if len(r.scratch) > 0 {
 			meshed_chunks += 1
 		}
 	}
@@ -277,4 +323,48 @@ renderer_draw :: proc(r: ^Renderer, w: ^World, view_proj: matrix[4, 4]f32, camer
 		drawn += 1
 	}
 	return
+}
+
+// Thin dark edges around the block being looked at, like Minecraft. They are depth-tested,
+// so other blocks in front still cover them.
+renderer_draw_outline :: proc(r: ^Renderer, view_proj: matrix[4, 4]f32, pos: Block_Pos, camera_pos: [3]f64) {
+	view_proj := view_proj
+	lines := block_outline(pos, camera_pos)
+	gl.Enable(gl.BLEND)
+	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+	gl.UseProgram(r.overlay_program)
+	gl.UniformMatrix4fv(r.u_overlay_matrix, 1, false, &view_proj[0, 0])
+	gl.Uniform4f(r.u_overlay_color, 0, 0, 0, 0.9)
+	gl.BindVertexArray(r.overlay_vao)
+	gl.BindBuffer(gl.ARRAY_BUFFER, r.overlay_vbo)
+	gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(lines) * size_of([3]f32), &lines[0])
+	gl.DrawArrays(gl.LINES, 0, i32(len(lines)))
+	gl.Disable(gl.BLEND)
+}
+
+// A small plus in the middle of the screen that inverts whatever is behind it, so it shows on any colour.
+renderer_draw_crosshair :: proc(r: ^Renderer, width, height: i32) {
+	px := [2]f32{2 / f32(width), 2 / f32(height)} // one pixel in screen units
+	A, T :: f32(CROSSHAIR_ARM), f32(CROSSHAIR_THICKNESS)
+	// Three rectangles, so the middle isn't inverted twice: the whole bar across, and the upright above and below it.
+	rects := [3][4]f32{{-A, -T, A, T}, {-T, T, T, A}, {-T, -A, T, -T}}
+	verts: [18][3]f32
+	for rect, i in rects {
+		x0, y0, x1, y1 := rect[0] * px.x, rect[1] * px.y, rect[2] * px.x, rect[3] * px.y
+		quad := [6][3]f32{{x0, y0, 0}, {x1, y0, 0}, {x1, y1, 0}, {x0, y0, 0}, {x1, y1, 0}, {x0, y1, 0}}
+		copy(verts[i * 6:], quad[:])
+	}
+	identity: matrix[4, 4]f32 = 1
+	gl.Disable(gl.DEPTH_TEST)
+	gl.Enable(gl.BLEND)
+	gl.BlendFunc(gl.ONE_MINUS_DST_COLOR, gl.ONE_MINUS_SRC_COLOR)
+	gl.UseProgram(r.overlay_program)
+	gl.UniformMatrix4fv(r.u_overlay_matrix, 1, false, &identity[0, 0])
+	gl.Uniform4f(r.u_overlay_color, 1, 1, 1, 1)
+	gl.BindVertexArray(r.overlay_vao)
+	gl.BindBuffer(gl.ARRAY_BUFFER, r.overlay_vbo)
+	gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(verts) * size_of([3]f32), &verts[0])
+	gl.DrawArrays(gl.TRIANGLES, 0, i32(len(verts)))
+	gl.Disable(gl.BLEND)
+	gl.Enable(gl.DEPTH_TEST)
 }

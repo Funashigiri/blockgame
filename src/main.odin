@@ -11,7 +11,7 @@ import "vendor:glfw"
 import stbi "vendor:stb/image"
 
 GAME_NAME :: "blockgame"
-VERSION   :: "0.0.4"
+VERSION   :: "0.0.5"
 
 WINDOW_WIDTH  :: 1280
 WINDOW_HEIGHT :: 720
@@ -112,6 +112,10 @@ main :: proc() {
 	player := spawn_player()
 	camera := spawn_camera()
 	keys := Key_State{last_jump_press = -1}
+	selected := 2 // index into PLACEABLE: stone
+	looked_at: Ray_Hit
+	break_down, place_down: bool
+	break_timer, place_timer: f64
 
 	last_mouse_x, last_mouse_y := glfw.GetCursorPos(window)
 	last_time := glfw.GetTime()
@@ -151,6 +155,23 @@ main :: proc() {
 			player_update(&world, &player, camera.heading, read_input(window, &keys), min(dt, 0.1))
 			camera.pos = player_eye(player)
 			camera_align(&camera)
+
+			for i in 0 ..< len(PLACEABLE) {
+				if key_down(window, glfw.KEY_1 + i32(i)) {
+					selected = i
+				}
+			}
+			looked_at = raycast(&world, camera.pos, look_direction(camera))
+			breaking := glfw.GetMouseButton(window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+			placing := glfw.GetMouseButton(window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+			if button_fires(breaking, &break_down, &break_timer, dt) && looked_at.hit {
+				try_break(&world, &renderer, looked_at.block)
+			}
+			if button_fires(placing, &place_down, &place_timer, dt) && looked_at.hit {
+				try_place(&world, &renderer, player, looked_at.before, PLACEABLE[selected])
+			}
+			// Look again, so the outline already sits on what the edit left behind.
+			looked_at = raycast(&world, camera.pos, look_direction(camera))
 		}
 
 		fps_frames += 1
@@ -158,12 +179,14 @@ main :: proc() {
 		if fps_timer >= 1 {
 			fps := int(f64(fps_frames) / fps_timer + 0.5)
 			mode := "полёт" if player.flying else "ходьба"
-			glfw.SetWindowTitle(window, fmt.ctprintf("%s %s | %d FPS | %s", GAME_NAME, VERSION, fps, mode))
+			title := fmt.ctprintf("%s %s | %d FPS | %s | блок: %s", GAME_NAME, VERSION, fps, mode, BLOCK_NAMES[PLACEABLE[selected]])
+			glfw.SetWindowTitle(window, title)
 			fps_frames = 0
 			fps_timer = 0
 		}
 
-		drawn, ok := draw_frame(window, &renderer, &world, camera)
+		target: Maybe(Block_Pos) = looked_at.block if looked_at.hit else nil
+		drawn, ok := draw_frame(window, &renderer, &world, camera, target, !bench)
 		if !ok {
 			// Minimized: sleep until something happens instead of spinning the CPU.
 			glfw.WaitEvents()
@@ -196,8 +219,9 @@ spawn_camera :: proc() -> Camera {
 	return Camera{pos = player_eye(spawn_player()), heading = {0, 0, -1}, pitch = SPAWN_PITCH}
 }
 
+// Draws the world, an outline around the target block if there is one, and the crosshair if asked.
 // Returns how many chunks were drawn; ok is false when the window is minimized and nothing was drawn.
-draw_frame :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World, cam: Camera) -> (drawn: int, ok: bool) {
+draw_frame :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World, cam: Camera, target: Maybe(Block_Pos) = nil, crosshair := false) -> (drawn: int, ok: bool) {
 	width, height := glfw.GetFramebufferSize(window)
 	if width == 0 || height == 0 {
 		return 0, false
@@ -207,7 +231,15 @@ draw_frame :: proc(window: glfw.WindowHandle, r: ^Renderer, w: ^World, cam: Came
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 	aspect := f32(width) / f32(height)
 	projection := linalg.matrix4_perspective_f32(math.to_radians(f32(FOV_DEGREES)), aspect, NEAR_PLANE, FAR_PLANE)
-	return renderer_draw(r, w, projection * camera_view(cam), cam.pos), true
+	view_proj := projection * camera_view(cam)
+	drawn = renderer_draw(r, w, view_proj, cam.pos)
+	if pos, has_target := target.?; has_target {
+		renderer_draw_outline(r, view_proj, pos, cam.pos)
+	}
+	if crosshair {
+		renderer_draw_crosshair(r, width, height)
+	}
+	return drawn, true
 }
 
 key_down :: proc(window: glfw.WindowHandle, key: i32) -> bool {

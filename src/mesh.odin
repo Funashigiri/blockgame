@@ -64,6 +64,12 @@ block_texture :: proc(block: Block, side: Side) -> Tex {
 		return .Grass_Side
 	case .Stone:
 		return .Stone
+	case .Sand:
+		return .Sand
+	case .Planks:
+		return .Planks
+	case .Core:
+		return .Core
 	}
 	return .Dirt
 }
@@ -78,7 +84,7 @@ build_chunk_mesh :: proc(w: ^World, chunk: ^Chunk, out: ^[dynamic]Vertex) {
 		for z in i32(0) ..< CHUNK_SIZE {
 			for x in i32(0) ..< CHUNK_SIZE {
 				block := chunk.blocks[block_index(x, y, z)]
-				if block == .Air || block == .Core {
+				if block == .Air {
 					continue
 				}
 				for side in Side {
@@ -94,7 +100,8 @@ build_chunk_mesh :: proc(w: ^World, chunk: ^Chunk, out: ^[dynamic]Vertex) {
 						continue
 					}
 					layer := u8(block_texture(block, side))
-					shade := SIDE_SHADE[side]
+					// The molten core glows, so it is equally bright from every side.
+					shade := u8(255) if block == .Core else SIDE_SHADE[side]
 					for corner, i in SIDE_CORNERS[side] {
 						g := ([3]f64)(base + [3]i32{x, y, z} + corner)
 						pos := face_to_world(face, g.x, g.z, g.y) - chunk.anchor

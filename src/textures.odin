@@ -7,11 +7,20 @@ Tex :: enum u8 {
 	Grass_Side,
 	Dirt,
 	Stone,
+	Sand,
+	Planks,
+	Core,
 }
 
-GRASS_COLOR :: [3]f32{112, 178, 72}
-DIRT_COLOR  :: [3]f32{134, 96, 67}
-STONE_COLOR :: [3]f32{128, 128, 128}
+GRASS_COLOR  :: [3]f32{112, 178, 72}
+DIRT_COLOR   :: [3]f32{134, 96, 67}
+STONE_COLOR  :: [3]f32{128, 128, 128}
+SAND_COLOR   :: [3]f32{219, 207, 163}
+PLANKS_COLOR :: [3]f32{162, 130, 78}
+
+// Molten core: dark crust, orange melt and bright yellow hot spots.
+@(rodata)
+CORE_COLORS := [?][3]f32{{70, 20, 10}, {70, 20, 10}, {200, 70, 15}, {230, 95, 20}, {230, 95, 20}, {245, 120, 25}, {255, 165, 45}, {255, 200, 80}}
 
 // A few discrete brightness steps per pixel read as hand-drawn pixel art rather than smooth noise.
 @(rodata)
@@ -61,6 +70,27 @@ texel :: proc(tex: Tex, x, y: i32) -> [3]f32 {
 			color *= 0.78
 		}
 		return color
+	case .Sand:
+		// Fine even grain with the odd darker speck.
+		color := SAND_COLOR * STONE_STEPS[hash3(x, y, 7) % len(STONE_STEPS)]
+		if hash3(x, y, 8) % 11 == 0 {
+			color *= 0.85
+		}
+		return color
+	case .Planks:
+		// Four boards 4 pixels high, a dark gap under each, one joint per board at a different spot.
+		board := y / 4
+		color := PLANKS_COLOR * (0.92 + 0.12 * f32(hash3(board, 0, 9) % 4) / 3)
+		color *= 0.96 + 0.08 * f32(hash3(x, y, 10) % 3) / 2 // wood grain
+		joint := i32(hash3(board, 1, 9) % TEX_SIZE)
+		if y % 4 == 3 || x == joint {
+			color *= 0.68
+		}
+		return color
+	case .Core:
+		// Blobs two pixels across, so it reads as lumps of crust floating on melt.
+		color := CORE_COLORS[hash3(x / 2, y / 2, 11) % len(CORE_COLORS)]
+		return color * (0.94 + 0.12 * f32(hash3(x, y, 12) % 3) / 2)
 	}
 	return {}
 }
